@@ -1,0 +1,539 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source(here::here("InitializeProject.R"))
+library(tidyverse)
+library(magrittr)
+projectdir <- "scRNASeq_CD45_with_cellcycle_regression"
+```
+
+
+```{r load_data}
+library(Biobase)
+
+sample_annotation <- rio::import(here::here(datadir, projectdir, "sample_annotation.csv")) %>%
+  mutate(rowname = make.names(SAMPLEID)) %>%
+  column_to_rownames("rowname")
+
+data <- rio::import(here::here(datadir, projectdir,"log_matrix.csv")) %>%
+  column_to_rownames("V1") %>%
+  as.matrix
+
+selected_samples <- intersect(rownames(sample_annotation),
+                              colnames(data))
+phenoData <- sample_annotation %>%
+  extract(selected_samples) %>%
+  AnnotatedDataFrame
+
+assayData <- data[,selected_samples]
+
+eset <- ExpressionSet(assayData = assayData,
+                      phenoData = phenoData)
+
+rm(data)
+rm(assayData)
+gc()
+
+eset %>%
+  rio::export(here::here(datadir, projectdir, "ExpressionSet.RDS"))
+```
+
+
+```{r circus_stratified_selected_expression}
+library(limma)
+library(Biobase)
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+
+selection <- list(Myel_vs_T = c(0,1,3,8,12,13,5,6,7,11,18),
+                  T_vs_Tu = c(5, 6, 7, 11, 18, 4, 9, 14, 15, 20),
+                  Myel_vs_Tu = c(0, 1, 3, 8, 12, 13, 4, 9, 14, 15, 20)) %>%
+  purrr::map(function(selection){
+    paste0("C", selection) %>%
+      set_names(.,.)
+  })
+
+database <- iTALK::database
+
+database <- rio::import_list(here::here(datadir, "italk_database.xlsx")) %>%
+  extract2("italk_selected")
+
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, projectdir, "ExpressionSet.RDS"))
+eset$KNOCKOUT <- str_detect(eset$SAMPLEID, "ko")
+
+eset$KNOCKOUT <- factor(eset$KNOCKOUT, labels = c("WT", "KO"))
+
+eset$strata <- eset$CLUSTER %>%
+  str_replace(": .*", "") %>%
+  paste("C", ., sep = "") %>%
+  set_names(.,.)
+
+orthology <- rio::import(here::here(datadir, "orthology_hs_mm.RDS"))
+# determine differentially expressed genes with cluster as a blocking factor
+
+esets_stratified <- eset$strata %>%
+  unique %>%
+  set_names(.,.) %>%
+  purrr::map(function(cluster, eset){
+    eset[,eset$strata == cluster]
+  },
+  eset = eset)
+
+fits_stratified <- esets_stratified %>%
+  purrr::map(function(eset){
+    design <- model.matrix(~ KNOCKOUT,
+                       data = eset)
+    colnames(design) <- colnames(design) %>%
+      str_replace("CLUSTER", "") %>%
+      str_replace("KNOCKOUT", "")
+    fit <- eset %>%
+      lmFit(design) %>%
+      eBayes
+    
+  })
+
+
+logFC_stratified <- fits_stratified %>%
+  purrr::map(function(fit){
+    fit %>%
+      topTable(coef = "KO", number = Inf) %>%
+      rownames_to_column("mgi_symbol") %>%
+      inner_join(orthology) %>%
+      mutate(ligand = hgnc_symbol,
+             receptor = hgnc_symbol)
+  })
+  
+# save this list tooo
+
+logFC_stratified %>%
+  rio::export(here::here(resultsdir, projectdir, "input_italk.xlsx"))
+
+logFC_ligand_receptor <- logFC_stratified %>%
+  purrr::map(function(logFC){
+    logFC %>%
+      inner_join(orthology)
+  }) %>%
+  bind_rows(.id = "cluster") %>%
+  dplyr::select(hgnc_symbol, logFC, AveExpr, adj.P.Val, cluster) %>%
+  distinct()
+
+# eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+# orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+#                                                  from_filters = "mgi_symbol") %>%
+#  dplyr::select(hgnc_symbol, mgi_symbol)
+
+# orthology %>%
+#  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+#highly_exprs_genes <- expression %>%
+#  t %>% 
+#  data.frame %>%
+#  mutate(cell_type = paste0("C", eset$CLUSTER),
+#         compare_group = factor(eset$KNOCKOUT, 
+#                                levels = c("WT", "KO"))) %>%
+#  rawParse(top_genes=75,
+#           stats='mean')
+
+
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint') %>%
+  set_names(.,.)
+
+  
+  
+#res <- comm_list %>%
+#  purrr::map(function(x){
+#    res_cat<-FindLR(highly_exprs_genes,
+#                    datatype='mean_count',
+#                    comm_type=x)
+#    
+#  })
+
+
+ligand <- logFC_ligand_receptor %>%
+  inner_join(database, by = c("hgnc_symbol" = "Ligand.ApprovedSymbol")) %>%
+  dplyr::select(hgnc_symbol, logFC, adj.P.Val, AveExpr, cluster) %>%
+  dplyr::rename(ligand = hgnc_symbol,
+                cell_from_logFC = logFC,
+                cell_from_q.value = adj.P.Val,
+                cell_from_mean_exprs = AveExpr,
+                cell_from = cluster) %>%
+  mutate(name_from = cell_from) %>%
+  distinct
+
+receptor <-  logFC_ligand_receptor %>%
+  inner_join(database, by = c("hgnc_symbol" = "Receptor.ApprovedSymbol")) %>%
+  dplyr::select(hgnc_symbol, logFC, adj.P.Val, AveExpr, cluster) %>%
+  dplyr::rename(receptor = hgnc_symbol,
+                cell_to_logFC = logFC,
+                cell_to_q.value = adj.P.Val,
+                cell_to_mean_exprs = AveExpr,
+                cell_to = cluster) %>%
+  mutate(name_to = cell_to) %>%
+  distinct
+
+ligand_receptor <- database %>%
+  inner_join(ligand, by = c("Ligand.ApprovedSymbol" = "ligand")) %>%
+  inner_join(receptor, by = c("Receptor.ApprovedSymbol" = "receptor")) %>%
+  dplyr::rename(ligand = Ligand.ApprovedSymbol,
+                receptor = Receptor.ApprovedSymbol) %>%
+  dplyr::select(ligand, 
+                receptor, 
+                cell_from, 
+                name_from, 
+                cell_from_mean_exprs, 
+                cell_from_logFC, 
+                cell_from_q.value,
+                cell_to, 
+                name_to, 
+                cell_to_mean_exprs, 
+                cell_to_logFC, 
+                cell_to_q.value,
+                Classification) %>%
+  dplyr::filter(cell_from_q.value < 0.05 | cell_to_q.value < 0.05) %>%
+  dplyr::mutate(strength = abs(cell_from_mean_exprs * cell_to_mean_exprs)) %>%
+  dplyr::mutate(direction_to = sign(cell_to_logFC) * -log10(cell_to_q.value),
+                direction_from = sign(cell_from_logFC) * -log10(cell_from_q.value)) %>%
+  dplyr::mutate(link.arr.col = case_when(direction_to < log10(0.05) & direction_from > -log10(0.05) ~ "#dfc27d",
+                                         direction_to > -log10(0.05) & direction_from < log10(0.05) ~ "#9933ff",
+                                         direction_to < log10(0.05) | direction_from < log10(0.05) ~ "#00ccff",
+                                         TRUE ~ "#d73027")) %>%
+  dplyr::mutate(link.arr.lty = case_when(cell_from_q.value < 0.05 ~ "solid",
+                                         TRUE ~ "dashed"),
+                link.arr.type = case_when(abs(cell_to_q.value) < 0.05 ~ "triangle",
+                                          TRUE ~ "ellipse")) %>%
+  dplyr::mutate(link.arr.lwd = case_when(link.arr.lty == "solid" ~ abs(cell_from_logFC),
+                                         TRUE ~ 0))
+
+ligand_receptor_stratified <- selection %>%
+  purrr::map(function(selection, ligand_receptor){
+    result <- ligand_receptor %>%
+      dplyr::filter(cell_from %in% selection & cell_to %in% selection)
+    result %>%
+      mutate(comm_type = Classification) %>%
+      tidyr::nest(gg = -"Classification") %>%
+      deframe %>%
+      purrr::map(data.frame)
+  },
+  ligand_receptor = ligand_receptor) %>%
+  unlist(recursive = FALSE)
+
+ligand_receptor_stratified %>%
+  rio::export(here::here(resultsdir, projectdir, "input_italk_ligand_receptor.xlsx"))
+
+# if one wants to display special ligand - relations change this code here:
+# -----------------------------------------
+LRPlot_data <- ligand_receptor_stratified %>%
+  purrr::map(function(data){
+    data %>%
+      arrange(desc(strength)) %>%
+      mutate(strength = strength/max(strength)) %>%
+      slice_head(n = 50)
+    # if you want to inlcude THBS, add it here
+  })
+# -----------------------------------------
+
+#for (plot in names(LRPlot_data)){
+#  plots[[plot]] <- try(ggplotify::as.grob(~LRPlot(LRPlot_data[[plot]],
+#                                                # link.arr.lwd = ligand_receptor_stratified[[plot]]$strength,
+#                                                datatype = "DEG")))
+  
+#}
+
+LRPlots <- list()
+
+for (x in names(LRPlot_data)){
+  data <- LRPlot_data[[x]]
+  LRPlots[[x]] <- as.ggplot(~ LRPlot(data, 
+                                     datatype = "DEG", 
+                                     link.arr.lwd= data$link.arr.lwd, 
+                                     link.arr.type = data$link.arr.type, 
+                                     link.arr.col = data$link.arr.col, 
+                                     link.arr.lty = data$link.arr.lty))
+}
+
+LRPlots %>%
+  purrr::map2(names(.),
+              function(plot, name){
+                filename = here::here(plotsdir, projectdir, paste0(name, "_expression_circos.pdf"))
+                ggsave(filename = filename,
+                       plot = plot,
+                       width = 10,
+                       height = 10)
+              })
+
+```
+
+
+
+```{r circus_stratified_selected_logFC}
+library(limma)
+library(Biobase)
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+
+selection <- list(Myel_vs_T = c(0,1,3,8,12,13,5,6,7,11,18),
+                  T_vs_Tu = c(5, 6, 7, 11, 18, 4, 9, 14, 15, 20),
+                  Myel_vs_Tu = c(0, 1, 3, 8, 12, 13, 4, 9, 14, 15, 20)) %>%
+  purrr::map(function(selection){
+    paste0("C", selection) %>%
+      set_names(.,.)
+  })
+
+database <- iTALK::database
+
+database <- rio::import_list(here::here(datadir, "italk_database.xlsx")) %>%
+  extract2("italk_selected")
+
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, projectdir, "ExpressionSet.RDS"))
+eset$KNOCKOUT <- str_detect(eset$SAMPLEID, "ko")
+
+eset$KNOCKOUT <- factor(eset$KNOCKOUT, labels = c("WT", "KO"))
+
+eset$strata <- eset$CLUSTER %>%
+  str_replace(": .*", "") %>%
+  paste("C", ., sep = "") %>%
+  set_names(.,.)
+
+orthology <- rio::import(here::here(datadir, "orthology_hs_mm.RDS"))
+# determine differentially expressed genes with cluster as a blocking factor
+
+esets_stratified <- eset$strata %>%
+  unique %>%
+  set_names(.,.) %>%
+  purrr::map(function(cluster, eset){
+    eset[,eset$strata == cluster]
+  },
+  eset = eset)
+
+fits_stratified <- esets_stratified %>%
+  purrr::map(function(eset){
+    design <- model.matrix(~ KNOCKOUT,
+                       data = eset)
+    colnames(design) <- colnames(design) %>%
+      str_replace("CLUSTER", "") %>%
+      str_replace("KNOCKOUT", "")
+    fit <- eset %>%
+      lmFit(design) %>%
+      eBayes
+    
+  })
+
+
+logFC_stratified <- fits_stratified %>%
+  purrr::map(function(fit){
+    fit %>%
+      topTable(coef = "KO", number = Inf) %>%
+      rownames_to_column("mgi_symbol") %>%
+      inner_join(orthology) %>%
+      mutate(ligand = hgnc_symbol,
+             receptor = hgnc_symbol)
+  })
+  
+# save this list tooo
+
+logFC_stratified %>%
+  rio::export(here::here(resultsdir, projectdir, "input_italk.xlsx"))
+
+logFC_ligand_receptor <- logFC_stratified %>%
+  purrr::map(function(logFC){
+    logFC %>%
+      inner_join(orthology)
+  }) %>%
+  bind_rows(.id = "cluster") %>%
+  dplyr::select(hgnc_symbol, logFC, AveExpr, adj.P.Val, cluster) %>%
+  distinct()
+
+# eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+# orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+#                                                  from_filters = "mgi_symbol") %>%
+#  dplyr::select(hgnc_symbol, mgi_symbol)
+
+# orthology %>%
+#  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+#highly_exprs_genes <- expression %>%
+#  t %>% 
+#  data.frame %>%
+#  mutate(cell_type = paste0("C", eset$CLUSTER),
+#         compare_group = factor(eset$KNOCKOUT, 
+#                                levels = c("WT", "KO"))) %>%
+#  rawParse(top_genes=75,
+#           stats='mean')
+
+
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint') %>%
+  set_names(.,.)
+
+  
+  
+#res <- comm_list %>%
+#  purrr::map(function(x){
+#    res_cat<-FindLR(highly_exprs_genes,
+#                    datatype='mean_count',
+#                    comm_type=x)
+#    
+#  })
+
+
+ligand <- logFC_ligand_receptor %>%
+  inner_join(database, by = c("hgnc_symbol" = "Ligand.ApprovedSymbol")) %>%
+  dplyr::select(hgnc_symbol, logFC, adj.P.Val, AveExpr, cluster) %>%
+  dplyr::rename(ligand = hgnc_symbol,
+                cell_from_logFC = logFC,
+                cell_from_q.value = adj.P.Val,
+                cell_from_mean_exprs = AveExpr,
+                cell_from = cluster) %>%
+  mutate(name_from = cell_from) %>%
+  distinct
+
+receptor <-  logFC_ligand_receptor %>%
+  inner_join(database, by = c("hgnc_symbol" = "Receptor.ApprovedSymbol")) %>%
+  dplyr::select(hgnc_symbol, logFC, adj.P.Val, AveExpr, cluster) %>%
+  dplyr::rename(receptor = hgnc_symbol,
+                cell_to_logFC = logFC,
+                cell_to_q.value = adj.P.Val,
+                cell_to_mean_exprs = AveExpr,
+                cell_to = cluster) %>%
+  mutate(name_to = cell_to) %>%
+  distinct
+
+ligand_receptor <- database %>%
+  inner_join(ligand, by = c("Ligand.ApprovedSymbol" = "ligand")) %>%
+  inner_join(receptor, by = c("Receptor.ApprovedSymbol" = "receptor")) %>%
+  dplyr::rename(ligand = Ligand.ApprovedSymbol,
+                receptor = Receptor.ApprovedSymbol) %>%
+  dplyr::select(ligand, 
+                receptor, 
+                cell_from, 
+                name_from, 
+                cell_from_mean_exprs, 
+                cell_from_logFC, 
+                cell_from_q.value,
+                cell_to, 
+                name_to, 
+                cell_to_mean_exprs, 
+                cell_to_logFC, 
+                cell_to_q.value,
+                Classification) %>%
+  dplyr::filter(cell_from_q.value < 0.05 | cell_to_q.value < 0.05) %>%
+  dplyr::mutate(strength = abs(cell_from_logFC * cell_to_logFC)) %>%
+  dplyr::mutate(direction_to = sign(cell_to_logFC) * -log10(cell_to_q.value),
+                direction_from = sign(cell_from_logFC) * -log10(cell_from_q.value)) %>%
+  dplyr::mutate(link.arr.col = case_when(direction_to < log10(0.05) & direction_from > -log10(0.05) ~ "#dfc27d",
+                                         direction_to > -log10(0.05) & direction_from < log10(0.05) ~ "#9933ff",
+                                         direction_to < log10(0.05) | direction_from < log10(0.05) ~ "#00ccff",
+                                         TRUE ~ "#d73027")) %>%
+  dplyr::mutate(link.arr.lty = case_when(cell_from_q.value < 0.05 ~ "solid",
+                                         TRUE ~ "dashed"),
+                link.arr.type = case_when(abs(cell_to_q.value) < 0.05 ~ "triangle",
+                                          TRUE ~ "ellipse")) %>%
+  dplyr::mutate(link.arr.lwd = case_when(link.arr.lty == "solid" ~ abs(cell_from_logFC),
+                                         TRUE ~ 0))
+
+ligand_receptor_stratified <- selection %>%
+  purrr::map(function(selection, ligand_receptor){
+    result <- ligand_receptor %>%
+      dplyr::filter(cell_from %in% selection & cell_to %in% selection)
+    result %>%
+      mutate(comm_type = Classification) %>%
+      tidyr::nest(gg = -"Classification") %>%
+      deframe %>%
+      purrr::map(data.frame)
+  },
+  ligand_receptor = ligand_receptor) %>%
+  unlist(recursive = FALSE)
+
+ligand_receptor_stratified %>%
+  rio::export(here::here(resultsdir, projectdir, "input_italk_ligand_receptor.xlsx"))
+
+# if one wants to display special ligand - relations change this code here:
+# -----------------------------------------
+LRPlot_data <- ligand_receptor_stratified %>%
+  purrr::map(function(data){
+    data %>%
+      arrange(desc(strength)) %>%
+      mutate(strength = strength/max(strength)) %>%
+      slice_head(n = 50)
+    # if you want to inlcude THBS, add it here
+  })
+# -----------------------------------------
+
+#for (plot in names(LRPlot_data)){
+#  plots[[plot]] <- try(ggplotify::as.grob(~LRPlot(LRPlot_data[[plot]],
+#                                                # link.arr.lwd = ligand_receptor_stratified[[plot]]$strength,
+#                                                datatype = "DEG")))
+  
+#}
+
+LRPlots <- list()
+
+for (x in names(LRPlot_data)){
+  data <- LRPlot_data[[x]]
+  LRPlots[[x]] <- as.ggplot(~ LRPlot(data, 
+                                     datatype = "DEG", 
+                                     link.arr.lwd= data$link.arr.lwd, 
+                                     link.arr.type = data$link.arr.type, 
+                                     link.arr.col = data$link.arr.col, 
+                                     link.arr.lty = data$link.arr.lty))
+}
+
+LRPlots %>%
+  purrr::map2(names(.),
+              function(plot, name){
+                filename = here::here(plotsdir, projectdir, paste0(name, "_logFC_circos.pdf"))
+                ggsave(filename = filename,
+                       plot = plot,
+                       width = 10,
+                       height = 10)
+              })
+
+```
+

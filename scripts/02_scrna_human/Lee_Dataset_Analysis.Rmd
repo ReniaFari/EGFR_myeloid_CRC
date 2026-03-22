@@ -1,0 +1,1056 @@
+---
+title: "scRNASeq Lee - RENIA"
+author: "Dana Krauss"
+output:
+  rmdformats::robobook:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+  html_document:
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    keep_md: yes
+  html_notebook:
+    theme: spacelab
+    highlight: textmate
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    toc_float: yes
+params: 
+  prefix : "Lee_scRNASeq" 
+  fdr_cutoff : 0.1
+  fc_cutoff : 1
+  wd: !r c("/srv/workspace/rprojects/USER/scRNASeq_Lee")
+  script_number : !r c("04-")
+---
+
+
+***scRNASeq Analysis*** Scripts combined from Seurat workflow George/ICBI & <https://hbctraining.github.io/scRNA-seq_online/schedule/links-to-lessons.html>
+
+***Dataset to analyse***
+
+Analysis of Published scRNASeq Dataset <https://doi.org/10.1038/s41588-020-0636-z> Lineage-dependent gene expression programs influence the immune landscape of colorectal cancer
+
+-   2 cohorts: KUL3 dataset , SMC dataset (10x Genomics)
+-   91,103 unsorted single cells from 23 Korean & 6 Belgian
+
+
+***
+# Load libraries
+
+<details>
+  <summary>***Libraries & Params - Click to expand***</summary>
+```{r setup}
+knitr::opts_chunk$set(message = TRUE)
+# load required libraries
+library(knitr)
+library("tidyverse")
+library("conflicted")
+library("BiocParallel")
+library("ggplot2")
+library("readr")
+library("RColorBrewer")
+library("dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("count", "dplyr")
+conflict_prefer("rowRanges", "MatrixGenerics")
+library("ggpubr")
+library("tibble")
+conflict_prefer("paste", "base")
+conflict_prefer("rename", "dplyr")
+library("tidyr")
+library("org.Hs.eg.db") #library("org.Mm.eg.db") 
+conflict_prefer("desc", "dplyr")
+
+library(Seurat)
+library(Matrix)
+library(RCurl)
+library(scales)
+library(cowplot)
+library(SingleCellExperiment)
+library(AnnotationHub)
+library(ensembldb)
+library(multtest)
+library(glmGamPoi)
+library(metap)
+library(patchwork)
+
+library(sctransform)
+library(SingleR)
+library(MAST)
+library(DESeq2)
+library(Nebulosa)
+library(celldex)
+library(ggrepel)
+library("ComplexHeatmap")
+library("circlize")
+
+
+wd <- params$wd
+results_dir = paste0(wd,"/results")
+plots_dir = paste0(wd,"/plots")
+data_dir =  paste0(wd,"/data")
+
+### pull variables from params into environment
+prefix <- params$prefix
+conditions <- params$conditions
+fdr_cutoff <- params$fdr_cutoff
+fc_cutoff <- params$fc_cutoff
+split_object <- params$split_integrate
+
+# select which apply to data
+color <- params$color
+color_selection <- params$color_selection
+n_cpus <- params$n_cpus
+script_number <- params$script_number
+
+
+
+
+save_plot <- function(filename, p, width=NULL, height=NULL) {
+  if (!is.null(width) && !is.null(height)) {
+    #ggsave(file.path(plots_dir, paste0("/",prefix,"/",filename, ".png")), plot = p, width = width, height = height)
+   # ggsave(file.path(plots_dir, paste0("/",prefix,"/",filename, ".svg")), plot = p, width = width, height = height)
+    ggsave(file.path(plots_dir, paste0("/",prefix,"/",filename, ".pdf")), plot = p, width = width, height = height)
+  } else {
+   # ggsave(file.path(plots_dir, paste0("/",prefix,"/",filename, ".png")), plot = p)
+   # ggsave(file.path(plots_dir, paste0("/",prefix,"/",filename, ".svg")), plot = p)
+    ggsave(file.path(plots_dir, paste0("/",prefix,"/",filename, ".pdf")), plot = p)
+  }
+}
+save_RDS <- function(dir, object,filename){
+  saveRDS(object, file.path(
+    dir,paste0(prefix,"/",script_number, prefix ,"_",filename,".RDS")))
+}
+
+
+plotComposition <- function(seurat) {
+table_samples_by_clusters <- seurat@meta.data %>%
+  group_by(sample, cluster) %>%
+  summarize(count = n()) %>%
+  spread(cluster, count, fill = 0) %>%
+  ungroup() %>%
+  mutate(total_cell_count = rowSums(.[c(2:ncol(.))])) %>%
+  dplyr::select(c('sample', 'total_cell_count', everything())) %>%
+  arrange(factor(sample, levels = levels(seurat@meta.data$sample)))
+
+knitr::kable(table_samples_by_clusters)
+
+table_clusters_by_samples <- seurat@meta.data %>%
+  group_by(cluster, sample) %>%
+  summarize(count = n()) %>%
+  spread(sample, count, fill = 0) %>%
+  ungroup() %>%
+  mutate(total_cell_count = rowSums(.[c(2:ncol(.))])) %>%
+  select(c('cluster', 'total_cell_count', everything())) %>%
+  arrange(factor(cluster, levels = levels(seurat@meta.data$cluster)))
+
+knitr::kable(table_clusters_by_samples)
+
+temp_labels <- seurat@meta.data %>%
+  group_by(sample) %>%
+  tally()
+
+
+p1 <- table_samples_by_clusters %>%
+  select(-c("total_cell_count")) %>%
+  reshape2::melt(id.vars = "sample") %>%
+  mutate(sample = factor(sample, levels = levels(as.factor(seurat@meta.data$sample)))) %>%
+  ggplot(aes(sample, value)) +
+  geom_bar(aes(fill = variable), position = "stack", stat = "identity") +
+  geom_text(
+    data = temp_labels,
+    aes(x = sample, y = Inf, label = paste0('n = ', format(n, big.mark = ',', trim = TRUE)), angle = 45, hjust= 0, vjust=-1),
+    color = 'black', size = 2.8
+  ) +
+  scale_fill_manual(name = "Cluster"
+                    , values = custom_colors$discrete
+                    ) +
+  scale_y_continuous(name = "Number of cells", labels = scales::comma, expand = c(0.01, 0)) +
+  coord_cartesian(clip = 'off') +
+  theme_bw() +
+  theme(
+    legend.position = 'left',
+    plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 16),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 20, r = 0, b = 0, l = 0, unit = 'pt')
+  )
+
+temp_labels <- seurat@meta.data %>%
+  group_by(cluster) %>%
+  tally() %>%
+  dplyr::rename('cluster' = cluster)
+
+p2 <- table_clusters_by_samples %>%
+  select(-c('total_cell_count')) %>%
+  reshape2::melt(id.vars = 'cluster') %>%
+  mutate(cluster = factor(cluster, levels = levels(seurat@meta.data$cluster))) %>%
+  ggplot(aes(cluster, value)) +
+  geom_bar(aes(fill = variable), position = 'stack', stat = 'identity') +
+  geom_text(
+    data = temp_labels,
+    aes(x = cluster, y = Inf, label = paste0('n = ', format(n, big.mark = ',', trim = TRUE)), vjust = -1),
+    color = 'black', size = 2.8
+  ) +
+  scale_fill_manual(name = 'sample'
+                    ,values =  custom_colors$discrete[2:3]
+                    ) +
+  scale_y_continuous(labels = scales::comma, expand = c(0.01, 0)) +
+  coord_cartesian(clip = 'off') +
+  theme_bw() +
+  theme(
+    legend.position = 'right',
+    plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 16),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title = element_blank(),
+    plot.margin = margin(t = 20, r = 0, b = 0, l = 10, unit = 'pt')
+  )
+p1 + p2 +
+    ggtitle("Composition SampleClusters by Number") +
+    theme(plot.title = element_text(color="black", size=14, vjust = 5)) +
+    plot_layout(ncol = 2, widths = c(
+        seurat@meta.data$sample %>% unique() %>% length(),
+        seurat@meta.data$cluster %>% unique() %>% length()
+    ))
+
+p_number <- p1 + p2 +
+    ggtitle("Composition SampleClusters by Number") +
+    theme(plot.title = element_text(color="black", size=14, vjust = 5)) +
+    plot_layout(ncol = 2, widths = c(
+        seurat@meta.data$sample %>% unique() %>% length(),
+        seurat@meta.data$cluster %>% unique() %>% length()
+    ))
+save_plot(paste0(script_number,prefix,"_",title,"_composition_samples_cluster_by_number"), p_number, width = 18, height = 8)
+
+
+temp_labels <- seurat@meta.data %>%
+  group_by(sample) %>%
+  tally()
+
+p3 <- table_samples_by_clusters %>%
+  select(-c('total_cell_count')) %>%
+  reshape2::melt(id.vars = 'sample') %>%
+  mutate(sample = factor(sample, levels = levels((as.factor(seurat@meta.data$sample))))) %>%
+  ggplot(aes(sample, value)) +
+  geom_bar(aes(fill = variable), position = 'fill', stat = 'identity') +
+  geom_text(
+    data = temp_labels,
+    aes(x = sample, y = Inf, label = paste0('n = ', format(n, big.mark = ',', trim = TRUE)), angle = 45, hjust= 0, vjust=-1),
+    color = 'black', size = 2.8
+  ) +
+  scale_fill_manual(name = 'Cluster', values = custom_colors$discrete) +
+  scale_y_continuous(name = 'Percentage [%]', labels = scales::percent_format(), expand = c(0.01,0)) +
+  coord_cartesian(clip = 'off') +
+  theme_bw() +
+  theme(
+    legend.position = 'left',
+    plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 16),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 20, r = 0, b = 0, l = 0, unit = 'pt')
+  )
+
+temp_labels <- seurat@meta.data %>%
+  group_by(cluster) %>%
+  tally() %>%
+  dplyr::rename('cluster' = cluster)
+p4 <- table_clusters_by_samples %>%
+  select(-c('total_cell_count')) %>%
+  reshape2::melt(id.vars = 'cluster') %>%
+  mutate(cluster = factor(cluster, levels = levels(seurat@meta.data$cluster))) %>%
+  ggplot(aes(cluster, value)) +
+  geom_bar(aes(fill = variable), position = 'fill', stat = 'identity') +
+  geom_text(
+    data = temp_labels, aes(x = cluster, y = Inf, label = paste0('n = ', format(n, big.mark = ',', trim = TRUE)), vjust = -1),
+    color = 'black', size = 2.8
+  ) +
+  scale_fill_manual(name = 'sample', values = custom_colors$discrete[2:3]) +
+  scale_y_continuous(name = 'Percentage [%]', labels = scales::percent_format(), expand = c(0.01,0)) +
+  coord_cartesian(clip = 'off') +
+  theme_bw() +
+  theme(
+    legend.position = 'right',
+    plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 16),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title = element_blank(),
+    plot.margin = margin(t = 20, r = 0, b = 0, l = 10, unit = 'pt')
+  )
+
+p3 + p4 +
+    ggtitle("Composition SampleClusters by Percentage ") +
+    theme(plot.title = element_text(color="black", size=14, vjust = 5)) +
+    plot_layout(ncol = 2, widths = c(
+        seurat@meta.data$sample %>% unique() %>% length(),
+        seurat@meta.data$cluster %>% unique() %>% length()
+    ))
+
+p_percent <- p3 + p4 +
+    ggtitle("Composition SampleClusters by Percentage") +
+    theme(plot.title = element_text(color="black", size=14, vjust = 5)) +
+    plot_layout(ncol = 2, widths = c(
+        seurat@meta.data$sample %>% unique() %>% length(),
+        seurat@meta.data$cluster %>% unique() %>% length()
+    ))
+
+save_plot(paste0(script_number,prefix,"_",title,"_composition_samples_topLayer_by_percent"), p_percent, width = 18, height = 8)
+return(list(p_number, p_percent))
+}
+```
+ </details> 
+
+Some custom colors
+```{r}
+custom_colors <- list()
+
+colors_dutch <- c(
+  '#FFC312','#C4E538','#12CBC4','#FDA7DF','#ED4C67',
+  '#F79F1F','#A3CB38','#1289A7','#D980FA','#B53471',
+  '#EE5A24','#009432','#0652DD','#9980FA','#833471',
+  '#EA2027','#006266','#1B1464','#5758BB','#6F1E51'
+)
+
+colors_spanish <- c(
+  '#40407a','#706fd3','#f7f1e3','#34ace0','#33d9b2',
+  '#2c2c54','#474787','#aaa69d','#227093','#218c74',
+  '#ff5252','#ff793f','#d1ccc0','#ffb142','#ffda79',
+  '#b33939','#cd6133','#84817a','#cc8e35','#ccae62'
+)
+
+custom_colors$discrete <- c(colors_dutch, colors_spanish)
+
+custom_colors$cell_cycle <- setNames(
+  c('#45aaf2', '#f1c40f', '#e74c3c', '#7f8c8d'),
+  c('G1',      'S',       'G2M',     '-')
+)
+```
+
+# Read in data from before
+```{r}
+# read back in- seurat object normalised
+seurat_obj_normalized <- readRDS(file.path(data_dir, paste0("03-", prefix, "_seurat_topLayer.RDS")))
+
+seurat_obj_normalized <- NormalizeData(object = seurat_obj_normalized)
+seurat_obj_normalized <- FindVariableFeatures(object = seurat_obj_normalized)
+seurat_obj_normalized <- ScaleData(object = seurat_obj_normalized)
+
+DefaultAssay(seurat_obj_normalized) <- "RNA"
+seurat_obj_normalized <- NormalizeData(object = seurat_obj_normalized)
+seurat_obj_normalized <- FindVariableFeatures(object = seurat_obj_normalized)
+seurat_obj_normalized <- ScaleData(object = seurat_obj_normalized)
+
+unique(Idents(seurat_obj_normalized))
+
+#Idents(seurat_obj_normalized)
+prop.table(table(Idents(seurat_obj_normalized), seurat_obj_normalized$KRAS), margin = 2)
+```
+
+## EGFR positive cells
+
+```{r EGFR feature plots RNA}
+p <- FeaturePlot(seurat_obj_normalized, features = "EGFR", 
+                 max.cutoff = 1, 
+                 pt.size = 0.01,
+                 reduction = "umap",
+    cols = c("lightgrey", "#04103C"),
+    keep.scale = "feature",
+    label = T,
+    raster=F)
+p
+save_plot(paste0(script_number,prefix,"_umap_EGFR_all"), p, height = 10,width = 12)
+
+p <- FeaturePlot(seurat_obj_normalized, features = "EGFR", 
+                 max.cutoff = 1, 
+                 pt.size = 0.01,
+                 reduction = "tsne",
+    cols = c("lightgrey", "#04103C"),
+    keep.scale = "feature",
+    label = T,
+    raster=F)
+p
+save_plot(paste0(script_number,prefix,"_tsne_EGFR_all"), p, height = 10,width = 12)
+
+
+
+#### Plot tsne & umap plots
+Idents(seurat_obj_normalized) <- seurat_obj_normalized$topLayer
+p1 <- DimPlot(seurat_obj_normalized, reduction = "tsne") + 
+   ggtitle('Cell types top layer')
+Idents(seurat_obj_normalized) <- seurat_obj_normalized$Cell_subtype
+p2 <- DimPlot(seurat_obj_normalized, reduction = "tsne") + 
+   ggtitle('Cell types subtype')
+p1 | p2
+p <- p1 + p2
+save_plot(paste0(script_number,prefix,"_tsne"), p, height = 8,width = 20)
+
+Idents(seurat_obj_normalized) <- seurat_obj_normalized$topLayer
+p1 <- DimPlot(seurat_obj_normalized, reduction = "umap") + 
+   ggtitle('Cell types top layer')
+Idents(seurat_obj_normalized) <- seurat_obj_normalized$Cell_subtype
+p2 <- DimPlot(seurat_obj_normalized, reduction = "umap") + 
+   ggtitle('Cell types subtype')
+p1 | p2
+p <- p1 + p2
+save_plot(paste0(script_number,prefix,"_umap"), p, height = 8,width = 20)
+
+
+
+
+#violin EGFR RNA total
+Idents(seurat_obj_normalized) <- seurat_obj_normalized$topLayer
+library(scCustomize)
+p <- VlnPlot_scCustom(seurat_object = seurat_obj_normalized,
+                      features = "EGFR", 
+                      raster = FALSE)
+p  
+save_plot(paste0(script_number,prefix,"_violin_EGFR_Expression"), p, height = 10,width = 16)
+p <- VlnPlot(seurat_obj_normalized,  features = "EGFR" )
+p  
+save_plot(paste0(script_number,prefix,"_violin_EGFR_Expression_2"), p, height = 10,width = 16)
+
+# vln_df = data.frame(EGFR = seurat_obj_normalized[["RNA"]]@data["EGFR",], cluster = seurat_obj_normalized$topLayer)
+# ggplot(vln_df, aes(x = cluster, y = EGFR)) + geom_violin(aes(fill = cluster), trim=TRUE, scale = "width")
+
+
+
+
+
+#Subset Myeloid 
+seurat_myeloid <- subset(x = seurat_obj_normalized, idents = "Myeloid")
+p <- FeaturePlot(seurat_myeloid, features = "EGFR", 
+                 max.cutoff = 1, 
+                 pt.size = 0.01,
+                 reduction = "umap",
+                 #split.by = "Health",
+    #cols = c("grey", "midnightblue"),
+    cols = c("lightgrey", "#04103C"),
+    keep.scale = "feature",
+    #blend = F,
+    #cols = palette_blues,
+    label = T,
+    raster=F)
+p
+save_plot(paste0(script_number,prefix,"_umap_EGFR_Myeloid"), p, height = 10,width = 12)
+
+
+
+
+
+```
+
+
+
+
+
+
+
+## PROGENy
+```{r PROGENy sc}
+library(progeny)
+library(decoupleR)
+library(pheatmap)
+net <- get_progeny(organism = 'human', top = 100)
+net
+
+# Extract the normalized log-transformed counts
+data <- seurat_obj_normalized
+mat <- as.matrix(data@assays$RNA@data)
+
+
+
+##### WATCH OUT, this part runs very long!!! I save the result separately, you can laod it again a bin down 
+
+
+# Run wmean
+acts <- run_wmean(mat=mat, net=net, .source='source', .target='target',
+                  .mor='weight', times = 100, minsize = 5)
+acts
+
+# Extract norm_wmean and store it in pathwayswmean in data
+data[['pathwayswmean']] <- acts %>%
+  dplyr::filter(statistic == 'norm_wmean') %>%
+  pivot_wider(id_cols = 'source', names_from = 'condition',
+              values_from = 'score') %>%
+  column_to_rownames('source') %>%
+  Seurat::CreateAssayObject(.)
+
+# Change assay
+DefaultAssay(object = data) <- "pathwayswmean"
+
+# Scale the data
+data <- ScaleData(data)
+data@assays$pathwayswmean@data <- data@assays$pathwayswmean@scale.data
+
+
+
+
+###### read in data separately
+
+data <- readRDS(file.path(data_dir, paste0("04-", prefix, "seurat_egfr_info.RDS")))
+
+
+
+
+#"lightgrey", "#04103C"
+p1 <- DimPlot(data, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "topLayer") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- (FeaturePlot(data, features = c("EGFR")) & 
+  scale_colour_gradient2(low = 'black', mid = 'lightgrey', high = 'red')) +
+  ggtitle('EGFR activity')
+p1 | p2
+p <- p1 + p2
+save_plot(paste0(script_number,prefix,"_EGFR_Pathway_Progeny"), p, height = 10,width = 16)
+
+
+#Subset myeloid cells
+Idents(data) <- data$Cell_subtype
+
+seurat_myeloid <- subset(x = data, 
+                         idents = c("SPP1+","Pro-inflammatory","Proliferating","cDC"))
+Idents(seurat_myeloid) <- seurat_myeloid$topLayer
+seurat_myeloid <- subset(x = seurat_myeloid, idents = c("Myeloid"))
+
+p1 <- DimPlot(seurat_myeloid, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "topLayer") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- DimPlot(seurat_myeloid, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "Cell_subtype") + 
+  NoLegend() + ggtitle('Cell types')
+p3 <- (FeaturePlot(seurat_myeloid,  features = c("EGFR"), max.cutoff = 2,  pt.size = 0.5, reduction = "umap", label = T, raster=F) & scale_colour_gradient2(low = '#04103C', mid = 'lightgrey', high = '#e84445')) +
+    ggtitle('EGFR activity')
+p1 | p2 | p3
+
+
+p <- p1 | p2 | p3
+p
+save_plot(paste0(script_number,prefix,"_EGFR_Pathway_Progeny_Myeloid"), p, height = 10,width = 18)
+
+
+#Plot violin Progeny total
+library(scCustomize)
+
+p <- VlnPlot_scCustom(seurat_object = data, 
+                      features = "EGFR", 
+                      raster = FALSE,
+                 pt.size = 0.01)
+save_plot(paste0(script_number,prefix,"_violin_EGFR_Progeny_Myeloid"), p, height = 10,width = 16)
+
+# Extract activities from object as a long dataframe
+df <- t(as.matrix(data@assays$pathwayswmean@data)) %>%
+  as.data.frame()
+hist(df$EGFR, breaks = 1000)
+
+# Extract activities from object as a long dataframe for myeloid cells
+df <- t(as.matrix(seurat_myeloid@assays$pathwayswmean@data)) %>%
+  as.data.frame()
+hist(df$EGFR, breaks = 1000)
+
+ordered_egfr = df$EGFR[order(df$EGFR,decreasing = F)]
+plot(x = 1:length(ordered_egfr), y = ordered_egfr)
+
+length(df$EGFR)
+
+#table(df$EGFR)
+
+length(which(df$EGFR >= 0))
+df_ordered <- df %>% arrange(EGFR)
+  
+quantile(x = df_ordered$EGFR, type = 4)
+
+
+
+egfr.cluster <- df %>%
+  add_column(EGFR_positive = df$EGFR >= 0.77) %>%
+  add_column(EGFR_negative = df$EGFR <= -0.52) %>%
+  mutate(EGFR_pathway = case_when(
+    EGFR_positive == TRUE ~ "up",
+    EGFR_negative == TRUE ~ "down",
+    EGFR_positive == FALSE ~ "else"))
+all(rownames(egfr.cluster) == rownames(seurat_myeloid@meta.data))
+
+seurat_myeloid$EGFR_pathway_activity <- egfr.cluster$EGFR_pathway
+saveRDS(seurat_myeloid, file.path(data_dir, paste0(script_number,prefix, "seurat_myeloid_egfr_pathway.RDS")))
+
+############## plot again after classification
+DimPlot(seurat_myeloid, 
+        pt.size = 0.5,
+        reduction = "umap", 
+        group.by = "EGFR_pathway_activity",
+        label = F,
+        cols = c("#d9d9d9","lightgrey","#ff0000" )
+        ) &
+    ggtitle('EGFR activity')
+
+
+
+
+p1 <- DimPlot(seurat_myeloid, 
+              reduction = "umap", 
+              label = TRUE, pt.size = 0.5, 
+              group.by = "topLayer") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- DimPlot(seurat_myeloid, 
+              reduction = "umap", 
+              label = TRUE, 
+              pt.size = 0.5, 
+              group.by = "Cell_subtype") + 
+  NoLegend() + ggtitle('Cell types')
+p3 <- DimPlot(seurat_myeloid, 
+              pt.size = 0.5,
+              reduction = "umap", 
+              group.by = "EGFR_pathway_activity",
+              label = F,
+              cols = c("#d9d9d9","lightgrey","#ff0000")) &
+    ggtitle('EGFR activity')
+p1 | p2 | p3
+
+p <- p1 | p2 | p3
+save_plot(paste0(script_number,prefix,"_EGFR_Pathway_Progeny_Myeloid_classification"), p, height = 10,width = 18)
+
+prop.table(table(seurat_myeloid$EGFR_pathway_activity,seurat_myeloid$Cell_subtype ), margin = 2)
+
+
+
+
+
+
+
+
+
+# Extract activities from object as a long dataframe
+df <- t(as.matrix(data@assays$pathwayswmean@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(data)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+# Transform to wide matrix
+top_acts_mat <- df %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') %>%
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+# Choose color palette
+palette_length = 100
+my_color = colorRampPalette(c("Darkblue", "white","red"))(palette_length)
+
+my_breaks <- c(seq(-2, 0, length.out=ceiling(palette_length/2) + 1),
+               seq(0.05, 2, length.out=floor(palette_length/2)))
+
+# Plot
+pheatmap::pheatmap(top_acts_mat, border_color = NA, color=my_color, breaks = my_breaks)
+
+
+
+
+
+saveRDS(data, file.path(data_dir, paste0(script_number,prefix, "seurat_egfr_info.RDS")))
+
+
+
+```
+
+
+
+## Subcluster Myeloid
+
+```{r Subcluster Myeloid}
+# DefaultAssay(seurat_myeloid) <- "SCT"
+# seurat_myeloid <- RunPCA(object = seurat_myeloid, 
+#                    npcs = 30, 
+#                    features = VariableFeatures(object = seurat_myeloid))
+# ElbowPlot(seurat_myeloid, ndims = 30)
+# seurat_myeloid <- FindNeighbors(object = seurat_myeloid, 
+#                                 dims = 1:4) #22? #adjust 1:40
+# seurat_myeloid <- FindClusters(object = seurat_myeloid, 
+#                                resolution = c(0.4, 0.5, 0.6, 0.7,0.8)) #c(0.4, 0.6, 0.8, 1.0, 1.4) #0.55
+# 
+# unique(seurat_myeloid$SCT_snn_res.0.4)
+# Idents(seurat_myeloid) <- seurat_myeloid$SCT_snn_res.0.4
+# 
+# seurat_myeloid <- RunUMAP(object = seurat_myeloid,
+#                     dims = 1:6,#adjust 11? # 25?
+#                     reduction = "pca",
+#                     n.neighbors = 26,
+#                     n.epochs = 400)
+# 
+# seurat_myeloid <- RunTSNE(object = seurat_myeloid, 
+#                     dims = 1:6, #adjust 11? 25?
+#                     perplexity = 30, #default = 30
+#                     max_iter = 1000, # max iteration, default = 1000
+#                     eta = 200, #learning rate, default = 200
+#                     verbose = TRUE) 
+# saveRDS(seurat_myeloid, file.path(data_dir, paste0(script_number,prefix, "seurat_myeloid.RDS")) )
+
+DimPlot(seurat_myeloid, group.by = "Cell_subtype")
+DimPlot(seurat_myeloid, group.by = "Cell_subtype", reduction = "tsne")
+FeaturePlot(seurat_myeloid, features = c("CD163", "SEPP1", "APOE", "MAF", "SPP1", "MKI67", "STMN1", "IL1A", "IL1B"), label = T)
+
+
+
+
+p1 <- DimPlot(seurat_myeloid, 
+              reduction = "umap", 
+              label = TRUE, pt.size = 0.5, 
+              group.by = "topLayer") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- DimPlot(seurat_myeloid, 
+              reduction = "umap", 
+              label = TRUE, 
+              pt.size = 0.5, 
+              group.by = "Cell_subtype") + 
+  NoLegend() + ggtitle('Cell types')
+p3 <- DimPlot(seurat_myeloid, 
+              pt.size = 0.5,
+              reduction = "umap", 
+              group.by = "EGFR_pathway_activity",
+              label = F,
+              cols = c("#d9d9d9","lightgrey","#ff0000")) &
+    ggtitle('EGFR activity')
+p <- p1 | p2 | p3
+save_plot(paste0(script_number,prefix,"_EGFR_Pathway_Progeny_Myeloid_classification_UMAP"), p, height = 10,width = 18)
+
+
+
+p1 <- DimPlot(seurat_myeloid, 
+              reduction = "tsne", 
+              label = TRUE, pt.size = 0.5, 
+              group.by = "topLayer") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- DimPlot(seurat_myeloid, 
+              reduction = "tsne", 
+              label = TRUE, 
+              pt.size = 0.5, 
+              group.by = "Cell_subtype") + 
+  NoLegend() + ggtitle('Cell types')
+p3 <- DimPlot(seurat_myeloid, 
+              pt.size = 0.5,
+              reduction = "tsne", 
+              group.by = "EGFR_pathway_activity",
+              label = F,
+              cols = c("#d9d9d9","lightgrey","#ff0000")) &
+    ggtitle('EGFR activity')
+p <- p1 | p2 | p3
+save_plot(paste0(script_number,prefix,"_EGFR_Pathway_Progeny_Myeloid_classification_tsne"), p, height = 10,width = 18)
+
+
+prop.table(table(seurat_myeloid$EGFR_pathway_activity,seurat_myeloid$Cell_subtype ), margin = 2)
+```
+
+
+
+### DEGs Myeloid
+
+```{r DE Myeloid Analysis Pathway up or down}
+seurat_DE <- seurat_myeloid
+Idents(seurat_DE) <- seurat_DE$EGFR_pathway_activity
+
+seurat_DE_HvL <- subset(seurat_DE, idents = c("up", "down"))
+
+#Comparison for genes happens here (EGFRlovshi Activity)
+DefaultAssay(seurat_DE_HvL) <- "RNA"
+diff_markers_all <- FindMarkers(object = seurat_DE_HvL,
+                                     ident.1 = "down",
+                                     ident.2 = "up",
+                                     logfc.threshold = 0.01,
+                                     only.pos = FALSE) 
+diff_markers_all <- diff_markers_all %>%
+  rownames_to_column("GeneName")
+
+library(writexl)
+write_xlsx(diff_markers_all, file.path(results_dir, paste0(script_number,prefix, "_down_vs_up_progeny_EGFR_deg_genes_FindMarkers_wilcox" , ".xlsx")))
+
+
+
+
+
+Idents(seurat_DE_HvL) <- seurat_DE_HvL$Cell_subtype
+diff_markers_Proinflammatory <- FindMarkers(object = seurat_DE_HvL,
+                                     ident.1 = "down",
+                                     ident.2 = "up",
+                                     group.by = "EGFR_pathway_activity",
+                                     logfc.threshold = 0.01,
+                                     only.pos = FALSE,
+                                     subset.ident = "Pro-inflammatory")
+diff_markers_Proinflammatory <- diff_markers_Proinflammatory %>%
+  rownames_to_column("GeneName")
+write_xlsx(diff_markers_Proinflammatory, file.path(results_dir, paste0(script_number,prefix, "_down_vs_up_deg_Proinflammatory_wilcox" , ".xlsx")))
+
+diff_markers_SPP1 <- FindMarkers(object = seurat_DE_HvL,
+                                     ident.1 = "down",
+                                     ident.2 = "up",
+                                     group.by = "EGFR_pathway_activity",
+                                     logfc.threshold = 0.01,
+                                     only.pos = FALSE,
+                                     subset.ident = "SPP1+")
+diff_markers_SPP1 <- diff_markers_SPP1 %>%
+  rownames_to_column("GeneName")
+write_xlsx(diff_markers_SPP1, file.path(results_dir, paste0(script_number,prefix, "_down_vs_up_deg_SPP1_wilcox" , ".xlsx")))
+
+
+
+diff_markers_Proliferating <- FindMarkers(object = seurat_DE_HvL,
+                                     ident.1 = "down",
+                                     ident.2 = "up",
+                                     group.by = "EGFR_pathway_activity",
+                                     logfc.threshold = 0.01,
+                                     only.pos = FALSE,
+                                     subset.ident = "Proliferating")
+diff_markers_Proliferating <- diff_markers_Proliferating %>%
+  rownames_to_column("GeneName")
+write_xlsx(diff_markers_Proliferating, file.path(results_dir, paste0(script_number,prefix, "_down_vs_up_deg_Proliferating_wilcox" , ".xlsx")))
+
+
+
+diff_markers_collected <- list(
+         down_vs_up_all_egfr_pathway = diff_markers_all,
+         down_vs_up_Proinflammatory_egfr_pathway = diff_markers_Proinflammatory,
+         down_vs_up_SPP1_egfr_pathway = diff_markers_SPP1,
+         down_vs_up_Proliferating_egfr_pathway = diff_markers_Proliferating)
+
+write_xlsx(diff_markers_collected, file.path(results_dir, paste0(script_number,prefix, "_collected_deg_down_vs_up_progeny_egfr" , ".xlsx")))
+
+
+
+###Create Volcano plot for myeloid (EGFRlo vs hi activity)- using a treshold
+
+# add a column of NAs
+diff_markers_SPP1$diffexpressed <- "NO"
+# if log2Foldchange > 0.5 and pvalue < 0.05, set as "UP" 
+diff_markers_SPP1$diffexpressed[diff_markers_SPP1$avg_log2FC > 0.5 & diff_markers_SPP1$p_val_adj < 0.05] <- "UP"
+# if log2Foldchange < -0.5 and pvalue < 0.05, set as "DOWN"
+diff_markers_SPP1$diffexpressed[diff_markers_SPP1$avg_log2FC < -0.5 & diff_markers_SPP1$p_val_adj < 0.05] <- "DOWN"
+
+
+
+# Now write down the name of genes beside the points...
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (adda NA in case they are not)
+diff_markers_SPP1$delabel <- NA
+diff_markers_SPP1$delabel[diff_markers_SPP1$diffexpressed !="NO" ] <- diff_markers_SPP1$GeneName[diff_markers_SPP1$diffexpressed != "NO"]
+
+
+#Draw Volcano
+q<-ggplot(data=diff_markers_SPP1, aes(x=avg_log2FC, y=-log10(p_val_adj), col=diffexpressed, label= delabel)) + 
+    geom_point() + 
+    theme_minimal()+
+  geom_text_repel(max.overlaps = Inf)
+q
+
+# Add lines as before...
+q2 <- q + geom_vline(xintercept=c(--0.5, -0.5), col="red") + xlim(-2, 2)+ 
+        geom_hline(yintercept=-log10(0.05), col="red") +  ylim(0, 75) 
+q2
+
+## Change point color 
+
+# 2. to automate a bit: ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+q3 <- q2 + scale_colour_manual(values = mycolors)
+
+q3
+
+save_plot(paste0(script_number,prefix,"_Volcano_SPP1_LOvsHi_limit_y"), q3, height = 10,width = 10)
+```
+
+
+#Create volcano with selected genes
+```{r New myeloid volcanos selection of genes}
+
+###Create Volcano plot for myeloid (EGFRlo vs hi activity) using selected genes
+# add a column of NAs
+diff_markers_SPP1$diffexpressed <- "NO"
+# if log2Foldchange > 0.5 and pvalue < 0.05, set as "UP" 
+diff_markers_SPP1$diffexpressed[diff_markers_SPP1$avg_log2FC > 0 & diff_markers_SPP1$p_val_adj < 0.05] <- "UP"
+# if log2Foldchange < -0.5 and pvalue < 0.05, set as "DOWN"
+diff_markers_SPP1$diffexpressed[diff_markers_SPP1$avg_log2FC < -0 & diff_markers_SPP1$p_val_adj < 0.05] <- "DOWN"
+
+
+
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (adda NA in case they are not)
+diff_markers_SPP1$delabel <- NA
+diff_markers_SPP1$delabel[diff_markers_SPP1$diffexpressed !="NO" ] <- diff_markers_SPP1$GeneName[diff_markers_SPP1$diffexpressed != "NO"]
+
+
+diff_markers_SPP1$genelabels <- ifelse(diff_markers_SPP1$GeneName == "IL1A" 
+                               |diff_markers_SPP1$GeneName == "IL1B"
+                              |diff_markers_SPP1$GeneName == "IL1RN"
+                              |diff_markers_SPP1$GeneName == "CXCL8"
+                              |diff_markers_SPP1$GeneName == "DUSP4"
+                              |diff_markers_SPP1$GeneName == "CCL3"
+                              |diff_markers_SPP1$GeneName == "CXCL2"
+                              |diff_markers_SPP1$GeneName == "CXCL3"
+                              |diff_markers_SPP1$GeneName == "CCL20"
+                              |diff_markers_SPP1$GeneName == "NFKBIA"	
+                              |diff_markers_SPP1$GeneName == "NFKB1"
+                              |diff_markers_SPP1$GeneName == "NLRP3"
+                              |diff_markers_SPP1$GeneName == "CCL2"
+                              |diff_markers_SPP1$GeneName == "MAP2K3"
+                              |diff_markers_SPP1$GeneName == "CDKN1A"	
+                              |diff_markers_SPP1$GeneName == "EREG"
+                              |diff_markers_SPP1$GeneName == "AREG"
+                               |diff_markers_SPP1$GeneName == "PLEK"
+                               |diff_markers_SPP1$GeneName == "CCL4"
+                              |diff_markers_SPP1$GeneName == "TNF"
+                              |diff_markers_SPP1$GeneName == "G0S2"
+                               |diff_markers_SPP1$GeneName == "APOE"
+                               |diff_markers_SPP1$GeneName == "APOC1"
+                              |diff_markers_SPP1$GeneName == "C1QA"
+                              |diff_markers_SPP1$GeneName == "C1QB"
+                              |diff_markers_SPP1$GeneName == "NUPR1"
+                              |diff_markers_SPP1$GeneName == "CXCL9"
+                               |diff_markers_SPP1$GeneName == "CCL18",
+                              TRUE, FALSE)  
+  
+#Draw Volcano
+q<-ggplot(data=diff_markers_SPP1, aes(x=avg_log2FC, y=-log10(p_val_adj), col=diffexpressed # label= delabel)) +
+                                      ))+ 
+      geom_point() + 
+    theme_minimal()+
+  geom_text_repel(
+     aes(avg_log2FC, -log10(p_val_adj)),
+     label = ifelse(diff_markers_SPP1$genelabels, diff_markers_SPP1$GeneName, ""),
+     box.padding = unit(0.45, "lines"),
+     hjust = 1, max.overlaps = Inf) 
+
+
+q
+
+# Add lines as before...
+q2 <- q + geom_vline(xintercept=c(--0, -0), col="black") + xlim(-2, 2)+ 
+        geom_hline(yintercept=-log10(0.05), col="black") +  ylim(0, 75) 
+q2
+
+# 2. to automate a bit: ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+q3 <- q2 + scale_colour_manual(values = mycolors)
+
+q3
+
+save_plot(paste0(script_number,prefix,"_Volcano_SPP1_LOvsHi_selec_limit_y"), q3, height = 8,width = 8)
+
+
+
+#Pro-inflammatory
+###Create Volcano plot for myeloid (EGFRlo vs hi activity)
+# add a column of NAs
+diff_markers_Proinflammatory$diffexpressed <- "NO"
+# if log2Foldchange > 0.5 and pvalue < 0.05, set as "UP" 
+diff_markers_Proinflammatory$diffexpressed[diff_markers_Proinflammatory$avg_log2FC > 0 & 
+                               diff_markers_Proinflammatory$p_val_adj < 0.05] <- "UP"
+# if log2Foldchange < -0.5 and pvalue < 0.05, set as "DOWN"
+diff_markers_Proinflammatory$diffexpressed[diff_markers_Proinflammatory$avg_log2FC < -0 & diff_markers_Proinflammatory$p_val_adj < 0.05] <- "DOWN"
+
+
+
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (adda NA in case they are not)
+diff_markers_Proinflammatory$delabel <- NA
+diff_markers_Proinflammatory$delabel[diff_markers_Proinflammatory$diffexpressed !="NO" ] <- diff_markers_Proinflammatory$GeneName[diff_markers_Proinflammatory$diffexpressed != "NO"]
+
+
+diff_markers_Proinflammatory$genelabels <- ifelse(diff_markers_Proinflammatory$GeneName == "IL1A" 
+                               |diff_markers_Proinflammatory$GeneName == "IL1B"
+                              |diff_markers_Proinflammatory$GeneName == "IL1RN"
+                              |diff_markers_Proinflammatory$GeneName == "CXCL8"
+                              |diff_markers_Proinflammatory$GeneName == "DUSP4"
+                              |diff_markers_Proinflammatory$GeneName == "CCL3"
+                              |diff_markers_Proinflammatory$GeneName == "CXCL2"
+                              |diff_markers_Proinflammatory$GeneName == "CXCL3"
+                              |diff_markers_Proinflammatory$GeneName == "CCL20"
+                              |diff_markers_Proinflammatory$GeneName == "NFKBIA"	
+                              |diff_markers_Proinflammatory$GeneName == "NFKB1"
+                              |diff_markers_Proinflammatory$GeneName == "NLRP3"
+                              |diff_markers_Proinflammatory$GeneName == "CCL2"
+                              |diff_markers_Proinflammatory$GeneName == "MAP2K3"
+                              |diff_markers_Proinflammatory$GeneName == "CDKN1A"	
+                              |diff_markers_Proinflammatory$GeneName == "EREG"
+                              |diff_markers_Proinflammatory$GeneName == "AREG"
+                               |diff_markers_Proinflammatory$GeneName == "PLEK"
+                               |diff_markers_Proinflammatory$GeneName == "CCL4"
+                              |diff_markers_Proinflammatory$GeneName == "TNF"
+                              |diff_markers_Proinflammatory$GeneName == "VCAN"
+                               |diff_markers_Proinflammatory$GeneName == "THBS1"
+                              |diff_markers_Proinflammatory$GeneName == "S100A6"
+                               |diff_markers_Proinflammatory$GeneName == "S100A8"
+                              |diff_markers_Proinflammatory$GeneName == "S100A9"
+                               |diff_markers_Proinflammatory$GeneName == "ZEB2"
+                               |diff_markers_Proinflammatory$GeneName == "APOE"
+                               |diff_markers_Proinflammatory$GeneName == "APOC1"
+                              |diff_markers_Proinflammatory$GeneName == "C1QA"
+                              |diff_markers_Proinflammatory$GeneName == "C1QB"
+                               |diff_markers_Proinflammatory$GeneName == "C1QC"
+                              |diff_markers_Proinflammatory$GeneName == "FTL" 
+                              |diff_markers_Proinflammatory$GeneName == "CCL18"
+                              |diff_markers_Proinflammatory$GeneName == "HSPA1B"
+                              |diff_markers_Proinflammatory$GeneName == "HSPA6"
+                              ,TRUE, FALSE)  
+  
+#Draw Volcano
+q<-ggplot(data=diff_markers_Proinflammatory, aes(x=avg_log2FC, y=-log10(p_val_adj), col=diffexpressed # label= delabel)) +
+                                      ))+ 
+      geom_point() + 
+    theme_minimal()+
+  geom_text_repel(aes(avg_log2FC, -log10(p_val_adj)),
+     label = ifelse(diff_markers_Proinflammatory$genelabels, diff_markers_Proinflammatory$GeneName, ""),
+     box.padding = unit(0.45, "lines"),
+     hjust = 1, max.overlaps = Inf) 
+
+
+q
+
+# Add lines as before...
+q2 <- q + geom_vline(xintercept=c(--0, -0), col="black") + xlim(-2, 2)+ 
+        geom_hline(yintercept=-log10(0.05), col="black") +  ylim(0, 75) 
+q2
+
+# 2. to automate a bit: ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+q3 <- q2 + scale_colour_manual(values = mycolors)
+
+q3
+
+save_plot(paste0(script_number,prefix,"_Volcano_Proinflammatory_LOvsHi_selec_limit_y"), q3, height = 8,width = 8)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,1131 @@
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source(here::here("InitializeProject.R"))
+library(tidyverse)
+library(magrittr)
+projectdir <- "scRNASeq_CD45_with_cellcycle_regression"
+```
+
+
+```{r load_data}
+library(Biobase)
+
+sample_annotation <- rio::import(here::here(datadir, projectdir, "sample_annotation.csv")) %>%
+  mutate(rowname = make.names(SAMPLEID)) %>%
+  column_to_rownames("rowname")
+
+data <- rio::import(here::here(datadir, projectdir,"log_matrix.csv")) %>%
+  column_to_rownames("V1") %>%
+  as.matrix
+
+selected_samples <- intersect(rownames(sample_annotation),
+                              colnames(data))
+phenoData <- sample_annotation %>%
+  extract(selected_samples) %>%
+  AnnotatedDataFrame
+
+assayData <- data[,selected_samples]
+
+eset <- ExpressionSet(assayData = assayData,
+                      phenoData = phenoData)
+
+rm(data)
+rm(assayData)
+gc()
+
+eset %>%
+  rio::export(here::here(datadir, projectdir, "ExpressionSet.RDS"))
+```
+
+
+
+```{r limma_stratified}
+library(limma)
+
+eset <- rio::import(here::here(datadir, projectdir, "ExpressionSet.RDS"))
+
+eset$GROUP <- eset$SAMPLEID %>%
+  str_detect("wtp") %>%
+  ifelse("WT", "KO")
+
+eset$CLUSTER <- eset$CLUSTER %>%
+  paste0("C",.)
+
+clusters <- eset$CLUSTER %>%
+  unique %>%
+  set_names(.,.)
+
+
+result_stratified <- clusters %>%
+  purrr::map(function(cluster, eset){
+    eset <- eset[,eset$CLUSTER == cluster]
+    eset$GROUP <- factor(eset$GROUP, levels = c("WT", "KO"))
+    design <- model.matrix(~0+GROUP,
+                           data = eset)
+    colnames(design) <- levels(eset$GROUP)
+    contrast_matrix <- makeContrasts(KO_vs_WT = KO - WT,
+                                     levels = design)
+    fit <- lmFit(eset, design) %>%
+      contrasts.fit(contrast_matrix) %>%
+      eBayes
+    coefs <- colnames(contrast_matrix) %>%
+      set_names(.,.)
+    result <- coefs %>%
+      purrr::map(function(coef, fit){
+        topTable(fit, 
+                 coef = coef,
+                 number = Inf)
+      },
+      fit = fit)
+  },
+  eset = eset) %>%
+  unlist(recursive = FALSE)
+
+
+```
+
+
+
+```{r gsva_transformation}
+library(GSVA)
+library(msigdbr)
+library(Biobase)
+
+parallel::detectCores()
+
+nCores <- floor(parallel::detectCores() * 0.5)
+# nCores = 3
+
+molsigdb <- msigdbr(species = "mouse") %>%
+  dplyr::filter(gs_subcat %in% c("GO:BP") | gs_cat %in% c("H", "C2"))
+
+term2gene <- molsigdb %>%
+  dplyr::select(gs_id, gene_symbol) %>%
+  tidyr::nest(gg = -"gs_id") %>%
+  deframe %>%
+  purrr::map(deframe)
+
+term2name <- molsigdb %>%
+  dplyr::select(gs_id, gs_cat, gs_subcat, gs_name, gs_exact_source) %>%
+  distinct %>%
+  mutate(rowname = gs_id) %>%
+  column_to_rownames("rowname")
+
+
+gsva <- eset %>%
+  gsva(gset.idx.list = term2gene,
+       parallel.sz = nCores,
+       min.sz =15)
+
+fData(gsva) <- term2name[featureNames(gsva),]
+gsva %>% 
+  rio::export(here::here(datadir, projectdir, "ExpressionSet_gsva.RDS"))
+```
+
+
+```{r KO_vs_WT_stratified_by_cluster}
+library(limma)
+gsva <- rio::import(here::here(datadir, projectdir, "ExpressionSet_gsva.RDS"))
+
+#gsva$CLUSTER <- gsva$CLUSTER %>%
+#  paste0("C", .)
+
+stratification_cluster <- unique(gsva$CLUSTER) %>%
+  str_sort() %>%
+  set_names(.,.)
+  
+
+fData(gsva)$gs_subcat[fData(gsva)$gs_subcat == ""] <- "H"
+
+stratification_subcat <- fData(gsva)$gs_subcat %>%
+  unique() %>%
+  set_names(.,.)
+
+gsva$TYPE <- str_detect(sampleNames(gsva), "ko") %>%
+  as.numeric %>%
+  factor(labels = c("WT", "KO"))
+
+gsva_stratified <- stratification_subcat %>%
+  purrr::map(function(subcat, stratification_cluster, gsva){
+    stratification_cluster %>%
+      purrr::map(function(cluster, subcat, gsva){
+        selected_features <- fData(gsva)$gs_subcat == subcat
+        selected_samples <- gsva$CLUSTER == cluster
+        gsva[selected_features,selected_samples]
+      },
+      gsva = gsva,
+      subcat = subcat)
+  },
+  gsva = gsva,
+  stratification_cluster = stratification_cluster) %>%
+  unlist(recursive = FALSE)
+
+
+fit <- gsva_stratified %>%
+  purrr::map(function(eset){
+    design <- model.matrix(~0+TYPE,
+                           data = eset)
+    contrast_matrix <- makeContrasts(KO_vs_WT = TYPEKO - TYPEWT,
+                                     levels = design)
+    eset %>%
+      lmFit(design) %>%
+      contrasts.fit(contrast_matrix) %>%
+      eBayes
+  })
+
+names(fit) <- names(fit) %>% 
+  make.names
+
+result <- fit %>%
+  purrr::map(topTable,
+             number = Inf,
+             coef = "KO_vs_WT")
+  
+
+result %>%
+  rio::export(here::here(resultsdir, projectdir, "gsva_limma_results.xlsx"))
+```
+
+
+
+
+```{r calculate_italk_DB_WT}
+library(limma)
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+library(httr)
+httr::set_config(config(ssl_verifypeer = FALSE))
+
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, "scRNASeq_CD45", "ExpressionSet_CD45_total.RDS"))
+eset$KNOCKOUT <- str_detect(eset$SAMPLEID, "wtp")
+
+eset$KNOCKOUT <- factor(eset$KNOCKOUT, labels = c("WT", "KO"))
+# determine differentially expressed genes with cluster as a blocking factor
+
+design <- model.matrix(~ KNOCKOUT + CLUSTER,
+                       data = pData(eset))
+
+colnames(design) <- colnames(design) %>%
+  str_replace("CLUSTER", "") %>%
+  str_replace("KNOCKOUT", "")
+
+fit <- eset %>%
+  lmFit(design) %>%
+  eBayes
+
+logFC <- fit %>%
+  topTable(coef = "KO", number = Inf)
+
+cell_col <- sample(color, length(unique(eset$CLUSTER)))
+
+eset$KNOCKOUT <- as.numeric(!str_detect(sampleNames(eset), "wtp"))
+eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+# palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+# orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+#                                                  from_filters = "mgi_symbol") %>%
+#  dplyr::select(hgnc_symbol, mgi_symbol)
+
+# orthology %>%
+#  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+orthology <- rio::import(here::here(datadir, "orthology_hs_mm.RDS"))
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+highly_exprs_genes <- expression %>%
+  t %>% 
+  data.frame %>%
+  mutate(cell_type = paste("C", eset$CLUSTER),
+         compare_group = eset$KNOCKOUT) %>%
+  dplyr::filter(compare_group == "WT") %>%
+  rawParse(top_genes=50,
+           stats='mean')
+
+
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint')
+
+names(cell_col) <- paste("C", unique(eset$CLUSTER))
+res<-NULL
+lrplots <- list()
+netplots <- list()
+for(comm_type in comm_list){
+  res_cat<-FindLR(highly_exprs_genes,
+                  datatype='mean count',
+                  comm_type=comm_type)
+  res_cat<-res_cat[order(res_cat$cell_from_mean_exprs*res_cat$cell_to_mean_exprs,decreasing=T),]
+  #plot by ligand category
+  #overall network plot
+  netplots[[comm_type]] <- NetView(res_cat,
+          col=cell_col,
+          vertex.label.cex=1,
+          arrow.width=1,
+          edge.max.width=5)
+  #top 20 ligand-receptor pairs
+  LRPlot(res_cat[1:20,],
+         datatype='mean count',
+         cell_col=cell_col,
+         link.arr.lwd=res_cat$cell_from_mean_exprs[1:20],
+         link.arr.width=res_cat$cell_to_mean_exprs[1:20],
+         text.vjust = "1cm")
+  title(comm_type)
+  lrplots[[comm_type]] <- recordPlot()
+  res<-rbind(res,res_cat)
+}
+
+res<-res[order(res$cell_from_mean_exprs*res$cell_to_mean_exprs,decreasing=T),][1:20,]
+netplots[["total"]] <- NetView(res,
+                               col=cell_col,
+                               vertex.label.cex=1,
+                               arrow.width=1,
+                               edge.max.width=5)
+LRPlot(res[1:20,],
+       datatype='mean count',
+       cell_col=cell_col,
+       link.arr.lwd=res$cell_from_mean_exprs[1:20],
+       link.arr.width=res$cell_to_mean_exprs[1:20])
+title("total")
+lrplots[["total"]] <- recordPlot()
+names(lrplots) <- paste("wildtype", names(lrplots), sep = "_")
+lrplots %>%
+  purrr::map2(names(lrplots),
+              function(x,y){
+                filename = paste(y, "pdf", sep = ".")
+                plot <- ggdraw(x)
+                ggsave(plot = plot,
+                       filename = filename,
+                       path = here::here(plotsdir),
+                       width = 7,
+                       height = 7)
+              })
+
+```
+
+```{r calculate_italk_DB_KO}
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+httr::set_config(config(ssl_verifypeer = FALSE))
+
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, "scRNASeq_CD45", "ExpressionSet_CD45_total.RDS"))
+
+eset$KNOCKOUT <- as.numeric(!str_detect(sampleNames(eset), "wtp"))
+eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+cell_col <- sample(color, length(unique(eset$CLUSTER)))
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+                                                 from_filters = "mgi_symbol") %>%
+  dplyr::select(hgnc_symbol, mgi_symbol)
+
+orthology %>%
+  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+highly_exprs_genes <- expression %>%
+  t %>% 
+  data.frame %>%
+  mutate(cell_type = paste("C", eset$CLUSTER),
+         compare_group = eset$KNOCKOUT) %>%
+  dplyr::filter(compare_group == 1) %>%
+  rawParse(top_genes=50,
+           stats='mean')
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint')
+
+names(cell_col) <- paste("C", unique(eset$CLUSTER))
+res<-NULL
+lrplots <- list()
+netplots <- list()
+for(comm_type in comm_list){
+  res_cat<-FindLR(highly_exprs_genes,
+                  datatype='mean count',
+                  comm_type=comm_type)
+  res_cat<-res_cat[order(res_cat$cell_from_mean_exprs*res_cat$cell_to_mean_exprs,decreasing=T),]
+  #plot by ligand category
+  #overall network plot
+  netplots[[comm_type]] <- NetView(res_cat,
+          col=cell_col,
+          vertex.label.cex=1,
+          arrow.width=1,
+          edge.max.width=5)
+  #top 20 ligand-receptor pairs
+  LRPlot(res_cat[1:20,],
+         datatype='mean count',
+         cell_col=cell_col,
+         link.arr.lwd=res_cat$cell_from_mean_exprs[1:20],
+         link.arr.width=res_cat$cell_to_mean_exprs[1:20],
+         text.vjust = "1.5cm")
+  title(comm_type)
+  lrplots[[comm_type]] <- recordPlot()
+  res<-rbind(res,res_cat)
+}
+
+res<-res[order(res$cell_from_mean_exprs*res$cell_to_mean_exprs,decreasing=T),][1:20,]
+netplots[["total"]] <- NetView(res,
+                               col=cell_col,
+                               vertex.label.cex=1,
+                               arrow.width=1,
+                               edge.max.width=5)
+LRPlot(res[1:20,],
+       datatype='mean count',
+       cell_col=cell_col,
+       link.arr.lwd=res$cell_from_mean_exprs[1:20],
+       link.arr.width=res$cell_to_mean_exprs[1:20])
+title("total")
+lrplots[["total"]] <- recordPlot()
+names(lrplots) <- paste("knockout", names(lrplots), sep = "_")
+lrplots %>%
+  purrr::map2(names(lrplots),
+              function(x,y){
+                filename = paste(y, "pdf", sep = ".")
+                plot <- ggdraw(x)
+                ggsave(plot = plot,
+                       filename = filename,
+                       path = here::here(plotsdir),
+                       width = 7,
+                       height = 7)
+              })
+
+```
+
+
+
+```{r italk_comparison}
+library(limma)
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, "scRNASeq_CD45", "ExpressionSet_CD45_total.RDS"))
+eset$KNOCKOUT <- str_detect(eset$SAMPLEID, "ko")
+
+eset$KNOCKOUT <- factor(eset$KNOCKOUT, labels = c("WT", "KO"))
+
+orthology <- rio::import(here::here(datadir, "orthology_hs_mm.RDS"))
+# determine differentially expressed genes with cluster as a blocking factor
+
+design <- model.matrix(~ KNOCKOUT + CLUSTER,
+                       data = pData(eset))
+
+colnames(design) <- colnames(design) %>%
+  str_replace("CLUSTER", "") %>%
+  str_replace("KNOCKOUT", "")
+
+fit <- eset %>%
+  lmFit(design) %>%
+  eBayes
+
+logFC <- fit %>%
+  topTable(coef = "KO", number = Inf) %>%
+  rownames_to_column("mgi_symbol") %>%
+  inner_join(orthology) %>%
+  mutate(ligand = hgnc_symbol,
+         receptor = hgnc_symbol)
+
+logFC_ligand <- logFC %>%
+  dplyr::select(ligand, logFC, adj.P.Val) %>%
+  mutate(color_ligand = case_when(logFC < 0 & adj.P.Val <= 0.05 ~ "blue",
+                                  logFC > 0 & adj.P.Val <= 0.05 ~ "red",
+                                  TRUE ~ "black")) %>%
+  dplyr::rename(cell_from_logFC = logFC,
+                adj.P.Val_ligand = adj.P.Val)
+
+logFC_receptor <- logFC %>%
+  dplyr::select(receptor, logFC, adj.P.Val) %>%
+  mutate(color_receptor = case_when(logFC < 0 & adj.P.Val <= 0.05 ~ "blue",
+                                    logFC > 0 & adj.P.Val <= 0.05 ~ "red",
+                                    TRUE ~ "black")) %>%
+  dplyr::rename(cell_to_logFC = logFC,
+                adj.P.Val_receptor = adj.P.Val)
+
+# eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+# orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+#                                                  from_filters = "mgi_symbol") %>%
+#  dplyr::select(hgnc_symbol, mgi_symbol)
+
+# orthology %>%
+#  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+highly_exprs_genes <- expression %>%
+  t %>% 
+  data.frame %>%
+  mutate(cell_type = paste("C", eset$CLUSTER),
+         compare_group = eset$KNOCKOUT) %>%
+  dplyr::filter(compare_group == "WT") %>%
+  rawParse(top_genes=50,
+           stats='mean')
+
+
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint')
+
+res <- comm_list %>%
+  purrr::map(function(x){
+    res_cat<-FindLR(highly_exprs_genes,
+                  datatype='mean count',
+                  comm_type=x)
+    
+  }) %>%
+  bind_rows
+
+res_logFC <- res %>%
+  left_join(logFC_ligand) %>%
+  left_join(logFC_receptor) %>%
+  mutate(strength = cell_from_mean_exprs * cell_to_mean_exprs) %>%
+  arrange(desc(strength)) %>%
+  separate(cell_from, into = c("cell_from", "name_from"), sep = ":") %>%
+  separate(cell_to, into = c("cell_to", "name_to"), sep = ":") %>%
+  # mutate(arrowhead = ifelse(color_receptor != "black","triangle","ellipse")) %>%
+  mutate(line = ifelse(color_ligand != "black", "solid", "dotted")) %>%
+  slice_head(n = 30)
+
+cluster <- unique(c(res_logFC$cell_from, res_logFC$cell_to))
+
+legend <- data.frame(cluster = c(res_logFC$cell_from, res_logFC$cell_to),
+                       name = c(res_logFC$name_from, res_logFC$name_to)) %>%
+  distinct %>%
+  mutate(name = paste(cluster, name, sep = ":")) %>%
+  arrange(cluster) %>%
+  mutate(color = WGCNA::labels2colors(row_number())) %>%
+  mutate(name = str_replace(name, "MΦ", "Macrophages"))
+
+cell_col <- legend %>%
+  dplyr::select(cluster, color) %>%
+  deframe
+
+plot <- ggplotify::as.ggplot(~LRPlot(res_logFC,
+                                     link.arr.lwd = res_logFC$strength,
+                                     # link.arr.lty = res_logFC$line,
+                                     # link.arr.type = res_logFC$arrowhead,
+                                     cell_col = cell_col,
+                                     datatype = "DEG"))
+
+# create a heatmap with the cell colors and extract the legend
+legend_plot <- legend %>%
+  ggplot(aes(x = 1, y = name, fill = name)) +
+  geom_tile() +
+  scale_fill_manual(values = legend$color,
+                    name = NULL) + 
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+legend_extract <- get_legend(legend_plot)
+
+
+plot_total <- ggdraw(plot_grid(plot_grid(plot),
+                               plot_grid(NULL, 
+                                         legend_extract, 
+                                         ncol = 1),
+                               ncol = 1,
+                               rel_heights = c(1, 0.2)))
+
+ggsave(filename = here::here(plotsdir, "circos.pdf"),
+       plot_total,
+       width = 10,
+       height = 12)
+
+```
+
+```{r circus_stratified}
+library(limma)
+library(Biobase)
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, "scRNASeq_CD45", "ExpressionSet_CD45_total.RDS"))
+eset$KNOCKOUT <- str_detect(eset$SAMPLEID, "ko")
+
+eset$KNOCKOUT <- factor(eset$KNOCKOUT, labels = c("WT", "KO"))
+
+orthology <- rio::import(here::here(datadir, "orthology_hs_mm.RDS"))
+# determine differentially expressed genes with cluster as a blocking factor
+
+design <- model.matrix(~ KNOCKOUT + CLUSTER,
+                       data = eset)
+
+colnames(design) <- colnames(design) %>%
+  str_replace("CLUSTER", "") %>%
+  str_replace("KNOCKOUT", "")
+
+fit <- eset %>%
+  lmFit(design) %>%
+  eBayes
+
+logFC <- fit %>%
+  topTable(coef = "KO", number = Inf) %>%
+  rownames_to_column("mgi_symbol") %>%
+  inner_join(orthology) %>%
+  mutate(ligand = hgnc_symbol,
+         receptor = hgnc_symbol)
+
+logFC_ligand <- logFC %>%
+  dplyr::select(ligand, logFC, adj.P.Val) %>%
+  mutate(color_ligand = case_when(logFC < 0 & adj.P.Val <= 0.05 ~ "blue",
+                                  logFC > 0 & adj.P.Val <= 0.05 ~ "red",
+                                  TRUE ~ "black")) %>%
+  dplyr::rename(cell_from_logFC = logFC,
+                adj.P.Val_ligand = adj.P.Val)
+
+logFC_receptor <- logFC %>%
+  dplyr::select(receptor, logFC, adj.P.Val) %>%
+  mutate(color_receptor = case_when(logFC < 0 & adj.P.Val <= 0.05 ~ "blue",
+                                    logFC > 0 & adj.P.Val <= 0.05 ~ "red",
+                                    TRUE ~ "black")) %>%
+  dplyr::rename(cell_to_logFC = logFC,
+                adj.P.Val_receptor = adj.P.Val)
+
+# eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+# orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+#                                                  from_filters = "mgi_symbol") %>%
+#  dplyr::select(hgnc_symbol, mgi_symbol)
+
+# orthology %>%
+#  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+highly_exprs_genes <- expression %>%
+  t %>% 
+  data.frame %>%
+  mutate(cell_type = paste("C", eset$CLUSTER),
+         compare_group = eset$KNOCKOUT) %>%
+  dplyr::filter(compare_group == "WT") %>%
+  rawParse(top_genes=50,
+           stats='mean')
+
+
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint') %>%
+  set_names(.,.)
+
+res <- comm_list %>%
+  purrr::map(function(x){
+    res_cat<-FindLR(highly_exprs_genes,
+                  datatype='mean count',
+                  comm_type=x)
+    
+  })
+
+res_logFC <- res %>%
+  purrr::map(function(res){
+    res %>%
+      left_join(logFC_ligand) %>%
+      left_join(logFC_receptor) %>%
+      mutate(strength = cell_from_mean_exprs * cell_to_mean_exprs) %>%
+      arrange(desc(strength)) %>%
+      separate(cell_from, into = c("cell_from", "name_from"), sep = ":") %>%
+      separate(cell_to, into = c("cell_to", "name_to"), sep = ":") %>%
+      # mutate(arrowhead = ifelse(color_receptor != "black","triangle","ellipse")) %>%
+      # mutate(line = ifelse(color_ligand != "black", "solid", "dotted")) %>%
+      slice_head(n = 30)
+  })
+  
+
+cluster <- res_logFC %>%
+  purrr::map(function(res_logFC){
+    unique(c(res_logFC$cell_from, res_logFC$cell_to))
+  })
+
+legend <- res_logFC %>%
+  purrr::map(function(res_logFC){
+   data.frame(cluster = c(res_logFC$cell_from, res_logFC$cell_to),
+                       name = c(res_logFC$name_from, res_logFC$name_to)) %>%
+    distinct %>%
+    mutate(name = paste(cluster, name, sep = ":")) %>%
+    arrange(cluster) %>%
+    mutate(color = WGCNA::labels2colors(row_number())) %>%
+    mutate(name = str_replace(name, "MΦ", "Macrophages"))
+})
+  
+  
+ 
+
+cell_col <- legend %>%
+  purrr::map(function(legend){
+    legend %>%
+      dplyr::select(cluster, color) %>%
+      deframe
+  })
+  
+
+plots <- list()
+
+for (comm in comm_list){
+  plots[[comm]] <- ggplotify::as.ggplot(~LRPlot(res_logFC[[comm]],
+           link.arr.lwd = res_logFC[[comm]]$strength,
+    #                             # link.arr.lty = res_logFC$line,
+    #                             # link.arr.type = res_logFC$arrowhead,
+    cell_col = cell_col[[comm]],
+    datatype = "DEG"))
+}
+
+
+# create a heatmap with the cell colors and extract the legend
+legend_plot <- legend %>%
+  ggplot(aes(x = 1, y = name, fill = name)) +
+  geom_tile() +
+  scale_fill_manual(values = legend$color,
+                    name = NULL) + 
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+legend_extract <- get_legend(legend_plot)
+
+
+plot_total <- ggdraw(plot_grid(plot_grid(plot),
+                               plot_grid(NULL, 
+                                         legend_extract, 
+                                         ncol = 1),
+                               ncol = 1,
+                               rel_heights = c(1, 0.2)))
+
+plots %>%
+  purrr::map2(names(.),
+              function(plot, name){
+    filename <- paste(name, "circos.pdf", sep = "_")
+    ggsave(filename = here::here(plotsdir, filename),
+    plot,
+    width = 10,
+    height = 10)
+  })
+
+ggsave(filename = here::here(plotsdir, "circos.pdf"),
+       plot_total,
+       width = 10,
+       height = 12)
+
+```
+
+
+```{r circus_stratified_selected}
+library(limma)
+library(Biobase)
+library(iTALK)
+library(orthologsBioMART)
+library(RSQLite)
+library(ggplotify)
+library(cowplot)
+library(RColorBrewer)
+
+selection <- list(Myel_vs_T = c(0,1,3,8,12,13,5,6,7,11,18),
+                  T_vs_Tu = c(5, 6, 7, 11, 18, 4, 9, 14, 15, 20),
+                  Myel_vs_Tu = c(0, 1, 3, 8, 12, 13, 4, 9, 14, 15, 20)) %>%
+  purrr::map(function(selection){
+    paste0("C", selection) %>%
+      set_names(.,.)
+  })
+
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+
+# load data
+eset <- rio::import(here::here(datadir, "scRNASeq_CD45", "ExpressionSet_CD45_total.RDS"))
+eset$KNOCKOUT <- str_detect(eset$SAMPLEID, "ko")
+
+eset$KNOCKOUT <- factor(eset$KNOCKOUT, labels = c("WT", "KO"))
+
+eset$strata <- eset$CLUSTER %>%
+  str_replace(": .*", "") %>%
+  paste("C", ., sep = "") %>%
+  set_names(.,.)
+
+orthology <- rio::import(here::here(datadir, "orthology_hs_mm.RDS"))
+# determine differentially expressed genes with cluster as a blocking factor
+
+esets_stratified <- eset$strata %>%
+  unique %>%
+  set_names(.,.) %>%
+  purrr::map(function(cluster, eset){
+    eset[,eset$strata == cluster]
+  },
+  eset = eset)
+
+fits_stratified <- esets_stratified %>%
+  purrr::map(function(eset){
+    design <- model.matrix(~ KNOCKOUT,
+                       data = eset)
+    colnames(design) <- colnames(design) %>%
+      str_replace("CLUSTER", "") %>%
+      str_replace("KNOCKOUT", "")
+    fit <- eset %>%
+      lmFit(design) %>%
+      eBayes
+    
+  })
+
+
+logFC_stratified <- fits_stratified %>%
+  purrr::map(function(fit){
+    fit %>%
+      topTable(coef = "KO", number = Inf) %>%
+      rownames_to_column("mgi_symbol") %>%
+      inner_join(orthology) %>%
+      mutate(ligand = hgnc_symbol,
+             receptor = hgnc_symbol)
+  })
+  
+# save this list tooo
+
+logFC_stratified %>%
+  rio::export(here::here(resultsdir, "input_italk.xlsx"))
+
+logFC_ligand <- logFC_stratified %>%
+  purrr::map(function(logFC){
+    logFC %>%
+      inner_join(orthology) %>%
+      mutate(ligand = hgnc_symbol,
+             receptor = hgnc_symbol)
+  }) %>%
+  bind_rows(.id = "cluster") %>%
+  dplyr::select(ligand, logFC, adj.P.Val, cluster) %>%
+  mutate(color_ligand = case_when(logFC < 0 & adj.P.Val <= 0.05 ~ "blue",
+                                  logFC > 0 & adj.P.Val <= 0.05 ~ "red",
+                                  TRUE ~ "black")) %>%
+  dplyr::rename(cell_from_logFC = logFC,
+                adj.P.Val_ligand = adj.P.Val)
+
+logFC_receptor <- logFC %>%
+  dplyr::select(receptor, logFC, adj.P.Val,cluster) %>%
+  mutate(color_receptor = case_when(logFC < 0 & adj.P.Val <= 0.05 ~ "blue",
+                                    logFC > 0 & adj.P.Val <= 0.05 ~ "red",
+                                    TRUE ~ "black")) %>%
+  dplyr::rename(cell_to_logFC = logFC,
+                adj.P.Val_receptor = adj.P.Val)
+
+# eset$CLUSTER <- eset$CLUSTER %>% str_wrap(20)
+pdata <- eset$CLUSTER
+expression <- exprs(eset)
+palette <- yarrr::piratepal(palette = "info2")
+
+# orthology mapping
+# orthology <- orthologsBioMART::findOrthologsMmHs(from_values = rownames(expression),
+#                                                  from_filters = "mgi_symbol") %>%
+#  dplyr::select(hgnc_symbol, mgi_symbol)
+
+# orthology %>%
+#  rio::export(here::here(datadir, "orthology_hs_mm.RDS"))
+
+
+
+expression <- expression[orthology$mgi_symbol,]
+rownames(expression) <- orthology$hgnc_symbol
+
+# alternatively, set the symbols to capitals
+rownames(expression) <- toupper(rownames(expression))
+
+# determine highly expressed genes
+highly_exprs_genes <- expression %>%
+  t %>% 
+  data.frame %>%
+  mutate(cell_type = paste("C", eset$CLUSTER),
+         compare_group = eset$KNOCKOUT) %>%
+  dplyr::filter(compare_group == "WT") %>%
+  rawParse(top_genes=50,
+           stats='mean')
+
+
+comm_list <- c('growth factor',
+               'other',
+               'cytokine',
+               'checkpoint') %>%
+  set_names(.,.)
+
+res <- comm_list %>%
+  purrr::map(function(x){
+    res_cat<-FindLR(highly_exprs_genes,
+                  datatype='mean count',
+                  comm_type=x)
+    
+  })
+
+res_logFC_total <- res %>%
+  purrr::map(function(res){
+    res %>%
+      left_join(logFC_ligand) %>%
+      left_join(logFC_receptor) %>%
+      mutate(strength = cell_from_mean_exprs * cell_to_mean_exprs) %>%
+      arrange(desc(strength)) %>%
+      separate(cell_from, into = c("cell_from", "name_from"), sep = ":") %>%
+      separate(cell_to, into = c("cell_to", "name_to"), sep = ":") %>%
+      # mutate(arrowhead = ifelse(color_receptor != "black","triangle","ellipse")) %>%
+      # mutate(line = ifelse(color_ligand != "black", "solid", "dotted")) %>%
+      slice_head(n = 30)
+  })
+  
+
+res_logFC <- 
+
+cluster <- res_logFC %>%
+  purrr::map(function(res_logFC){
+    unique(c(res_logFC$cell_from, res_logFC$cell_to))
+  })
+
+legend <- res_logFC %>%
+  purrr::map(function(res_logFC){
+   data.frame(cluster = c(res_logFC$cell_from, res_logFC$cell_to),
+                       name = c(res_logFC$name_from, res_logFC$name_to)) %>%
+    distinct %>%
+    mutate(name = paste(cluster, name, sep = ":")) %>%
+    arrange(cluster) %>%
+    mutate(color = WGCNA::labels2colors(row_number())) %>%
+    mutate(name = str_replace(name, "MΦ", "Macrophages"))
+})
+  
+  
+ 
+
+cell_col <- legend %>%
+  purrr::map(function(legend){
+    legend %>%
+      dplyr::select(cluster, color) %>%
+      deframe
+  })
+  
+
+plots <- list()
+
+for (comm in comm_list){
+  plots[[comm]] <- ggplotify::as.ggplot(~LRPlot(res_logFC[[comm]],
+           link.arr.lwd = res_logFC[[comm]]$strength,
+    #                             # link.arr.lty = res_logFC$line,
+    #                             # link.arr.type = res_logFC$arrowhead,
+    cell_col = cell_col[[comm]],
+    datatype = "DEG"))
+}
+
+
+# create a heatmap with the cell colors and extract the legend
+legend_plot <- legend %>%
+  ggplot(aes(x = 1, y = name, fill = name)) +
+  geom_tile() +
+  scale_fill_manual(values = legend$color,
+                    name = NULL) + 
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+legend_extract <- get_legend(legend_plot)
+
+
+plot_total <- ggdraw(plot_grid(plot_grid(plot),
+                               plot_grid(NULL, 
+                                         legend_extract, 
+                                         ncol = 1),
+                               ncol = 1,
+                               rel_heights = c(1, 0.2)))
+
+plots %>%
+  purrr::map2(names(.),
+              function(plot, name){
+    filename <- paste(name, "circos.pdf", sep = "_")
+    ggsave(filename = here::here(plotsdir, filename),
+    plot,
+    width = 10,
+    height = 10)
+  })
+
+ggsave(filename = here::here(plotsdir, "circos.pdf"),
+       plot_total,
+       width = 10,
+       height = 12)
+
+```
+
+```{r colorize_pathways}
+library(Biobase)
+library(limma)
+library(DESeq2)
+library(rWikiPathways)
+library(RCy3)
+
+pathways <- c("WP437",
+              "WP4806",
+              "WP4483",
+              "WP364",
+              "WP195")
+
+
+commands <- paste0('wikipathways import-as-pathway id=',pathways) 
+
+commands %>%
+  purrr::map(commandsRun)
+
+eset <- rio::import(here::here(datadir, "scRNASeq_CD45", "ExpressionSet_CD45_total.RDS"))
+eset$KNOCKOUT <- !str_detect(sampleNames(eset), "wtp")
+eset$KNOCKOUT <- as.numeric(eset$KNOCKOUT)
+featureNames(eset) <- toupper(featureNames(eset))
+stratification <- unique(eset$CLUSTER)
+names(stratification) <- paste("C", stratification, sep = "") %>% make.names
+
+result <- stratification %>%
+  purrr::map(function(x){
+    tmp <- eset[,eset$CLUSTER == x]
+    design = model.matrix(~KNOCKOUT, 
+                          data = pData(tmp))
+    lmFit(tmp, 
+          design) %>%
+      eBayes %>%
+      topTable(number = Inf) %>%
+      data.frame %>%
+      rownames_to_column("SYMBOL") %>%
+      dplyr::select(SYMBOL, everything())
+  })
+
+result <- result[names(result) != "C19..Unknown"]
+limma_results <- result
+limma_results <- result %>%
+  purrr::map2(.,
+              names(.),
+              function(x,y){
+                x %>% 
+                  dplyr::select("SYMBOL", 
+                                "logFC",
+                                "AveExpr",
+                                "t",
+                                "P.Value",
+                                "adj.P.Val") %>%
+                  set_names(c("SYMBOL", paste(c("logFC",
+                                            "AveExpr",
+                                            "t",
+                                            "P.Value",
+                                            "adj.P.Val"),
+                                          y,
+                                          sep = "_")))
+  }) %>%
+  purrr::reduce(left_join, by = "SYMBOL")
+
+
+networks <- getNetworkList()
+
+networks %>%
+  purrr::map(function(x){
+    print(x)
+    loadTableData(limma_results,
+                  data.key.column = "SYMBOL",
+                  table = "node",
+                  table.key.column = "name",
+                  namespace = "default",
+                  network = x)
+  })
+
+networks <- getNetworkList()
+names(networks) <- str_replace(networks, " - Homo sapiens", "") %>%
+  make.names() %>%
+  str_replace_all("\\.", "_")
+
+clusters <- colnames(limma_results)[grep("logFC", colnames(limma_results))]
+names(clusters) <- clusters %>%
+  str_replace("logFC_", "")
+
+networks %>%
+  purrr::map2(names(.),
+              function(x,y, clusters){
+                clusters %>%
+                  purrr::map2(names(.),
+                              function(x,y,network,network_name){
+                                file_name <- here::here(plotsdir, paste(network_name, y, "CD45_logFC", sep = "_"))
+                                print(x)
+                                print(network)
+                                setNodeColorMapping(table.column = x,
+                                                    table.column.values = c(-0.5,0,0.5),
+                                                    colors = c('#0000FF', '#FFFFFF', '#FF0000'),
+                                                    network = network,
+                                                    style.name = "logFC")
+                                setVisualStyle(style.name = "logFC", 
+                                               network = network)
+                                fitContent(selected.only = FALSE, 
+                                           network = network)
+                                
+                                exportImage(filename = file_name,
+                                            type = "PDF",
+                                            zoom = 500,
+                                            network = network)
+                                
+                              },
+                              network = x,
+                              network_name = y)
+              },
+              clusters = clusters)
+
+```
+
+

@@ -1,0 +1,391 @@
+---
+title: "scRNASeq Analyze"
+author: "O. Fari"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+    keep_md: true
+  pdf_document:
+    toc: true
+    toc_depth: '4'
+  rmdformats::robobook:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+  html_notebook:
+    theme: spacelab
+    highlight: textmate
+    toc: true
+    toc_depth: 4
+    df_print: paged
+    toc_float: true
+---
+
+
+***
+# Load libraries
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = TRUE)
+# load required libraries
+library(knitr)
+library("tidyverse")
+library("conflicted")
+library("BiocParallel")
+library("ggplot2")
+library("readr")
+library("RColorBrewer")
+library("dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("count", "dplyr")
+conflict_prefer("rowRanges", "MatrixGenerics")
+library("ggpubr")
+library("tibble")
+conflict_prefer("paste", "base")
+conflict_prefer("rename", "dplyr")
+library("tidyr")
+library("org.Hs.eg.db") 
+library("org.Mm.eg.db") 
+conflict_prefer("desc", "dplyr")
+
+library(Seurat)
+library(Matrix)
+library(RCurl)
+library(scales)
+library(cowplot)
+library(SingleCellExperiment)
+library(AnnotationHub)
+library(ensembldb)
+library(multtest)
+library(glmGamPoi)
+library(metap)
+library(patchwork)
+
+library(sctransform)
+library(SingleR)
+library(MAST)
+library(DESeq2)
+library(Nebulosa)
+library(celldex)
+library(ggrepel)
+library("ComplexHeatmap")
+library("circlize")
+
+save_plot <- function(filename, p, width=NULL, height=NULL) {
+  if (!is.null(width) && !is.null(height)) {
+   # ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p, width = width, height = height)
+   # ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p, width = width, height = height)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".pdf")), plot = p, width = width, height = height)
+    
+  } else {
+   # ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p)
+  #  ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".pdf")), plot = p)
+  }
+}
+save_RDS <- function(dir, object,filename){
+  saveRDS(object, file.path(
+    dir,paste0(prefix,"/","_",filename,".RDS")))
+}
+
+```
+
+
+# Single Cell Main Analysis from: https://satijalab.org/seurat/articles/pbmc3k_tutorial.html
+```{r load matrix data, include = FALSE}
+# load matrix and create seurat object - Didn't really use it in the end
+expression_matrix <- ReadMtx(
+  mtx = "/srv/workspace/rprojects/USER/scRNA_analysis_Renia/data/matrix.mtx.gz", features = "/srv/workspace/rprojects/USER/scRNA_analysis_Renia/data/features.tsv.gz",
+  cells = "/srv/workspace/rprojects/USER/scRNA_analysis_Renia/data/barcodes.tsv.gz"
+)
+seurat_object <- CreateSeuratObject(counts = expression_matrix)
+
+
+```
+
+
+# With pagoda filtering steps: https://pklab.med.harvard.edu/pagoda2.walkthrough.html
+# https://satijalab.org/seurat/archive/v4.3/integration_introduction
+```{r QC filtering and normalising}
+# Read the matrix count of raw data -needs gz compression
+counts_raw <- Read10X(data.dir =  "/srv/workspace/rprojects/USER/scRNA_analysis_Renia/data")
+
+# First filtering genes any cells that don't fit the expected detected gene vs molecule count relationship (molecules per cell and molecules per gene - using Pagoda like Tatiana)
+library(pagoda2)
+
+count_filt <- gene.vs.molecule.cell.filter(
+ counts_raw, max.cell.size = 5e4, min.cell.size = 500)
+
+# Here we added the names.delim to use the suffix and create an orig. ident for the 4 samples
+seurat_object <- CreateSeuratObject(counts = count_filt, names.delim = "-", names.field = 2)
+
+head(seurat_object)
+
+# I am trying to create a column with our samples names as character for later use
+# Define sample mapping
+sample_ref <- c(
+  "1" = "wtp3428",
+  "2" = "wtn3429",
+  "3" = "kop3430",
+  "4" = "kon3431"
+)
+
+# Careful with factor vs character values and name barcode mapping -wasn't recognising barcode
+converted_ids <- sample_ref[as.character(seurat_object$orig.ident)]
+names(converted_ids) <- colnames(seurat_object)  # ✅ this is the key fix!
+seurat_object$sample_id <- converted_ids        
+head(seurat_object)
+
+seurat_object$genotype <- substr(seurat_object$sample_id, 1, 2)
+
+
+#Add column with mitochondrial gene percentage
+seurat_object[["percent.mt"]] <- PercentageFeatureSet(seurat_object, pattern = "^mt-")
+
+head(seurat_object@meta.data, 50)
+
+VlnPlot(seurat_object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+#Filter mt percent
+seurat_object_filt_mt <- subset(seurat_object, percent.mt < 20)
+
+VlnPlot(seurat_object_filt_mt, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+# Split object and integrate data
+# Split the object into a list of sample-specific objects (wt and ko)
+seurat_list <- SplitObject(object = seurat_object_filt_mt, split.by = "sample_id") #genotype 22 clusters, sample_id   
+head(seurat_object_filt_mt)
+
+# Normalize and identify variable features for each dataset independently
+seurat_list <- lapply(X = seurat_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+ })
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = seurat_list)
+
+data.anchors <- FindIntegrationAnchors(object.list = seurat_list, anchor.features = features)
+
+# this command creates an 'integrated' data assay
+data.combined <- IntegrateData(anchorset = data.anchors)
+
+
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can segregate this list into markers of G2/M phase and markers of S phase 
+# Homology of human genes to mouse genes
+
+library(gprofiler2)
+mmus_s = gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+mmus_g2m = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+
+
+#Scale data and regressing cell cycle out- previous versions used to be with RegressOut (Tatiana)
+
+data.combined<- CellCycleScoring(
+  data.combined, s.features = mmus_s, g2m.features = mmus_g2m, set.ident = TRUE)
+  
+head(data.combined)
+
+
+# specify that we will perform downstream analysis on the corrected data note that the
+# original unmodified data still resides in the 'RNA' assay
+DefaultAssay(data.combined) <- "integrated"
+
+
+saveRDS(data.combined, file = "seurat_object_integr_regr.RDS")
+
+#Import the saved the regressed object, takes too long to run!
+
+#seurat_object_regr <- readRDS(
+
+
+#Run PCA
+data.combined<- ScaleData(data.combined, vars.to.regress = c("S.Score", "G2M.Score"))
+
+data.combined <- RunPCA(data.combined, features = VariableFeatures(object = data.combined))
+
+DimHeatmap(data.combined, dims = 1, cells = 500, balanced = TRUE)
+
+ElbowPlot(data.combined)
+
+#Cluster and UMAP- not sure how many dimensions I should choose- go with more better than less
+data.combined <- RunUMAP(data.combined, reduction = "pca", dims = 1:30)
+data.combined <- FindNeighbors(data.combined, reduction = "pca", dims = 1:30)
+data.combined <- FindClusters(data.combined, resolution = 0.5)
+
+p <- DimPlot(data.combined, reduction = "umap", label = TRUE)
+p
+
+save_plot(filename = "Umap_all_clusters", p = p)
+
+
+# Plot top markers for all clusters
+p1 <- DotPlot(data.combined, features = c("S100a8", "Retnlg", "Cd79a","Ighm", "Spp1", "Thbs1", "Fcgr1", "Ki67", "Epcam", "Lgals4", "Krt19",  "C1qc", "Apoe", "Cadps", "Lars2", "Gzma", "Trbc2", "Cd8a", "Nkg7", "Cd4", "Lef1", "Foxp3", "Ctla4", "Xcr1", "Cd209a", "Jchain", "Igkc", "Il17a", "Ccr7", "Hmox1", "Mcpt1", "Gata2", "Siglech",  "Flt3", "Col1a1")) + coord_flip()
+p1
+save_plot(filename = "Markers_clusters", p = p1, width = 12, height = 7)
+
+
+#Exporting all markers in excel
+library(openxlsx)
+
+#Find all markers with % of cells and logfc tresholds- fitting to Tatiana's excel -Wilcoxon rank sum
+cluster_markers <- FindAllMarkers(
+ object = data.combined, 
+  only.pos = TRUE,               # only positive markers
+ # min.pct = 0.1,          # expressed in at least 10% of cells in either group-used for diffexp test
+  logfc.threshold = 0.25         # minimum log2 fold change
+)
+
+
+# Filter by adjusted p-value & optional logFC-fits with Tatiana's excel
+filtered_markers <- cluster_markers %>%
+ filter(p_val_adj < 0.05, abs(avg_log2FC) >= 0.25) 
+filtered_markers <- filtered_markers %>%
+  select(gene, everything())
+
+
+# Select top 10 markers per cluster based on avg_log2FC
+top_markers_logFC <- filtered_markers %>%
+ group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+head(top_markers_logFC)
+
+#Export to Excel with multiple sheets
+
+# Create workbook
+wb <- createWorkbook()
+
+# Add logFC-based markers as one sheet
+addWorksheet(wb, "Top_by_logFC")
+writeData(wb, "Top_by_logFC", top_markers_logFC)
+
+
+# Also (optional): Export full filtered markers as extra sheet
+addWorksheet(wb, "Filtered_all")
+writeData(wb, "Filtered_all", filtered_markers)
+
+# Save Excel file
+saveWorkbook(wb, "Seurat_Markers_Output_Integr_samplesplit.xlsx")
+sessionInfo()
+```
+
+
+```{r subclustering}
+
+myeloid_subcl <- subset(data.combined, idents = c("0", "1", "4", "8", "12", "13", "15"))
+
+myeloid_subcl <- FindVariableFeatures(myeloid_subcl, selection.method = "vst", nfeatures = 2000)
+
+myeloid_subcl<- ScaleData(myeloid_subcl, vars.to.regress = c("S.Score", "G2M.Score"))
+
+myeloid_subcl <- RunPCA(myeloid_subcl, features = VariableFeatures(object = myeloid_subcl))
+
+DimHeatmap(myeloid_subcl, dims = 1, cells = 500, balanced = TRUE)
+
+ElbowPlot(myeloid_subcl)
+
+myeloid_subcl <- RunUMAP(myeloid_subcl, reduction = "pca", dims = 1:30)
+myeloid_subcl <- FindNeighbors(myeloid_subcl, reduction = "pca", dims = 1:30)
+myeloid_subcl <- FindClusters(myeloid_subcl, resolution = 0.5)
+
+p <- DimPlot(myeloid_subcl, reduction = "umap", label = TRUE)
+p
+
+cluster_markers <- FindAllMarkers(
+ object = myeloid_subcl, 
+  only.pos = TRUE,               # only positive markers
+ # min.pct = 0.1,          # expressed in at least 10% of cells in either group-used for diffexp test
+  logfc.threshold = 0.25         # minimum log2 fold change
+)
+```
+
+# Automated cluster annotation using SingleR from AI
+```{r automated annotation,include=FALSE}
+
+# Load libraries
+library(SingleR)
+library(celldex)
+library(SummarizedExperiment)
+
+# Load your single-cell dataset
+# Example: Load a Seurat object
+seurat_object_autom <- data.combined
+
+# Convert Seurat object to SingleCellExperiment
+sce <- as.SingleCellExperiment(seurat_object_autom)
+
+# Load mouse reference dataset
+ref <- celldex::MouseRNAseqData()
+
+# Run SingleR annotation
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+# Attach annotations back to your Seurat object
+seurat_object_autom$SingleR_labels <- pred$labels
+
+# Optionally visualize the annotation
+Seurat::DimPlot(seurat_object_autom, group.by = "SingleR_labels", reduction = "umap", label = TRUE, repel = TRUE)
+
+
+
+
+```
+
+
+# Load-prepare dataset & add annotation
+```{r load data, include=FALSE}
+load("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/seurat_object_myl.Rdata")
+
+annotation <- data.frame(seurat_clusters = c(0:11),
+                         Celltype = c("Macro_C1qc", "Granulo_S100a9",
+                                      "Macro_Vegfa", "Granulo_Cxcl2","cDC1_CD209a", "Monos_chil3", 
+                                      "DCs_act", "Granulo_Homox1","pDCs", "Mast","Basophilic", "Granulo_Mmp8"))
+annotation$seurat_clusters <- as.factor(annotation$seurat_clusters)
+metadata <- seurat_object_myl@meta.data %>%
+  add_column(Genotype = substr(rownames(seurat_object_myl@meta.data),1,3)) %>%
+  add_column(Genotype_short = substr(rownames(seurat_object_myl@meta.data),1,2)) %>%
+  add_column(rowIDs = rownames(seurat_object_myl@meta.data))
+head(seurat_object_myl)
+
+#metadata$CellGeno <- (paste(metadata$Celltype, "_", metadata$Genotype_short))
+  
+
+meta_merge <- left_join(metadata, annotation) %>%
+  column_to_rownames("rowIDs") 
+meta_merge$CellGeno <- (paste0(meta_merge$Celltype, "_", meta_merge$Genotype_short))
+
+
+
+
+all(seurat_object_myl@meta.data$nCount_RNA == meta_merge$nCount_RNA)
+all(rownames(meta_merge) == rownames(seurat_object_myl@meta.data))
+
+
+seurat_object_myl@meta.data <- meta_merge
+# ### workaround color dimplot error: Fehler: Must request at least one colour from a hue palette.
+# seurat_object_myl$cell_label <- Idents(seurat_object_myl)
+  
+  
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

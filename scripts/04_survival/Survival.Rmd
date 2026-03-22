@@ -1,0 +1,583 @@
+---
+title: "Survival GSE39582 GSVA Sig"
+author: "Bernadette & Renia"
+output:
+  rmdformats::robobook:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+  html_document:
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    keep_md: yes
+  html_notebook:
+    theme: spacelab
+    highlight: textmate
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    toc_float: yes
+---
+
+
+***
+# Load libraries
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = TRUE)
+# load required libraries
+library(knitr)
+library("tidyverse")
+library("conflicted")
+library("BiocParallel")
+library("ggplot2")
+library("readr")
+library("RColorBrewer")
+library("dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("count", "dplyr")
+conflict_prefer("rowRanges", "MatrixGenerics")
+library("ggpubr")
+library("tibble")
+conflict_prefer("paste", "base")
+conflict_prefer("rename", "dplyr")
+library("tidyr")
+library("org.Hs.eg.db") 
+library("org.Mm.eg.db") 
+conflict_prefer("desc", "dplyr")
+
+library(Seurat)
+library(Matrix)
+library(RCurl)
+library(scales)
+library(cowplot)
+library(SingleCellExperiment)
+library(AnnotationHub)
+library(ensembldb)
+library(multtest)
+library(glmGamPoi)
+library(metap)
+library(patchwork)
+
+library(sctransform)
+library(SingleR)
+library(MAST)
+library(DESeq2)
+library(Nebulosa)
+library(celldex)
+library(ggrepel)
+library("ComplexHeatmap")
+library("circlize")
+
+#source("InitializeProject.R")
+if (!exists("plotsdir")) plotsdir <- "."
+plot_dir <- plotsdir
+
+library(GSVA)
+library(rio)
+library(tidyverse)
+library(dplyr)
+library(nichenetr)
+library(ggpubr)
+library(genefilter)
+library(tibble)
+library(DESeq2)
+library(survminer)
+library(ggplot2)
+library(survival)
+library(corrplot)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(hgu133plus2.db)
+
+save_plot <- function(filename, p, width=NULL, height=NULL) {
+  if (!is.null(width) && !is.null(height)) {
+    ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p, width = width, height = height)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p, width = width, height = height)
+  } else {
+    ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p)
+  }
+}
+save_RDS <- function(dir, object,filename){
+  saveRDS(object, file.path(
+    dir,paste0(prefix,"/","_",filename,".RDS")))
+}
+
+```
+
+
+
+
+# Load-prepare dataset & add annotation
+```{r load data}
+# Load human Data
+eset <- readRDS("/srv/workspace/rprojects/USER/GSE39582/data/E-GEOD-40967.ExpressionSet.batchremoved.RDS")
+
+# Load feature Data
+fdata <- AnnotationDbi::select(hgu133plus2.db,
+                               columns = c("PROBEID", "ENTREZID", "SYMBOL", "GENENAME", "ENSEMBL", "UNIPROT"),
+                               keys = keys(hgu133plus2.db, keytype =
+                                             "PROBEID")) %>%
+  group_by(PROBEID) %>%
+  summarise_all(function(x){paste(unique(x), collapse = ", ")}) %>%
+  mutate(rowname = PROBEID) %>%
+  column_to_rownames("rowname")
+
+eset <- featureFilter(eset) 
+
+eset.filtered <- eset
+fData(eset.filtered) <- fdata[featureNames(eset.filtered),] # annotate the eset
+
+# Load pheno Data
+pdata <- pData(eset.filtered)
+
+eset.filtered <- eset.filtered[!grepl("uncharacterized", fData(eset.filtered)$GENENAME),]
+eset.filtered <- eset.filtered[!grepl("open reading frame", fData(eset.filtered)$GENENAME),]
+
+featureNames(eset.filtered) <- fData(eset.filtered)$SYMBOL
+
+# Extract expression Data
+exprs <- exprs(eset.filtered)
+  
+ncol(exprs)
+
+```
+
+
+
+## signatures
+```{r All Signatures}
+
+# Renia Fari Data from scRNA-sequnecing mice DEGs-general subsets and specific
+
+SCsig_1_myl <- c("APOE", "C1QA", "C1QB", "C1QC", "MS4A7", "CCL8", "LGMN", "CD81", "SELENOP", "PF4")
+
+SCsig_2_myl <- c("S100A9", "S100A8", "G0S2", "PGLYRP1", "CSF3R", "LRG1", "WFDC21", "STFA2L1", "HDC")
+
+SCsig_3_myl <-c("ASS1", "VEGFA", "FN1", "TGFBI", "AA467197", "ARG1", "INHBA", "TIMP1", "SPP1", "CCL24")
+
+#SCsig_1plus <- c("APOE", "C1QA", "C1QB", "C1QC", "MS4A7", "CCL8", "THBS1", "LGMN", "LYZ", "SELENOP", "PF4", "EGFR")
+#SCsig_2plus <- c("S100A9", "S100A8", "G0S2", "ACOD1", "HDC", "CXCL2", "TNFAIP2", "TREM1", "CSTA", "THBS1", "EGFR")
+#SCsig_3plus <-c("PLAC8", "FN1", "CHIA", "THBS1", "IFITM3", "LYZ", "INHBA", "ARG1", "CXCL10", "EGFR")
+
+m_t2g <- list(sig_1_myl_C1QC = SCsig_1_myl,
+              sig_2_myl_S100A9 = SCsig_2_myl,
+              sig_3_myl_SPP1 = SCsig_3_myl)
+
+```
+
+
+
+
+##GSVA and fit models
+```{r GSVA}
+
+## build GSVA parameter object
+gsvapar <- gsvaParam(exprs(eset.filtered),
+                     geneSets = m_t2g,
+                     maxDiff = TRUE,
+                     minSize = 6,
+                     kcdf = "Gaussian") # Poisson for RNA-seq data Gaussian for microarray
+
+# old GSVA code but defunct since sept2024
+#gsva <- gsva(eset.filtered,
+#             gset.idx.list = m_t2g,
+#             min.sz = 6,
+#             parallel.sz = 6,
+#             kcdf = "Gaussian") 
+
+## estimate GSVA enrichment scores for the three sets
+gsva_es <- gsva(gsvapar)
+
+#featureNames(gsva_es)
+#View(exprs(gsva_es))
+expression <- (gsva_es)
+data <- t(expression)
+
+
+# Build data frame 
+data_EGFR <- data.frame(t(exprs[c("EGFR", "THBS1"),]),
+                        time = as.numeric(eset.filtered$OS.DELAY),
+                        event = as.numeric(eset.filtered$OS.EVENT))
+
+data <- data.frame(data,
+                   time = as.numeric(eset.filtered$OS.DELAY),
+                   event = as.numeric(eset.filtered$OS.EVENT),
+                   data_EGFR$EGFR,
+                   data_EGFR$THBS1,
+                   TNM= (eset.filtered$TNM),
+                   CHEMOTHERAPY.ADJUVANT= (eset.filtered$CHEMOTHERAPY.ADJUVANT),
+                   LOCATION= (eset.filtered$LOCATION)
+                   )
+
+
+colnames(data) <- c("Sig_Myl1_C1QC", "Sig_Myl2_S100A9", "Sig_Myl3_SPP1",
+                    "TIME", "EVENT", "EGFR", "THBS1", "TNM", "CHEMOTHERAPY.ADJUVANT", "LOCATION")
+
+max(data$EGFR) #visualise maximum value
+
+# Optimal cutpoints 
+cutpoints <- surv_cutpoint(data,
+                           time = "TIME",
+                           event = "EVENT",
+                           variables = c( "Sig_Myl1_C1QC", "Sig_Myl2_S100A9", "Sig_Myl3_SPP1",
+                                         "EGFR", "THBS1"))
+
+#Plot datapoints and categorize expression values into high or low
+plot(cutpoints, "EGFR", palette = "npg")
+
+data.cat <- data.frame(surv_categorize(cutpoints), TNM = data$TNM, CHEMOTHERAPY.ADJUVANT = data$CHEMOTHERAPY.ADJUVANT, LOCATION = data$LOCATION)
+
+eset.filtered$EGFR <- data.cat$EGFR
+eset.filtered$THBS1 <- data.cat$THBS1
+
+
+
+# add a group for double selection
+eset.filtered$GROUP <- paste("EGFR", eset.filtered$EGFR,
+                             "THBS1", eset.filtered$THBS1, sep = ".")
+
+
+data.cat <- data.cat[!is.na(data.cat$TIME),]
+
+data.cat <- data.cat[data.cat$LOCATION == "distal",  ]
+#data.cat <- data.cat[data.cat$CHEMOTHERAPY.ADJUVANT == "N" & data.cat$TNM == 2, ] #we subset after gsva and after defining cutpoints
+
+
+
+### SAFETY CHECK for filter 
+c(expr_samples = ncol(exprs(eset.filtered)), data_samples = nrow(data), surv_samples = nrow(data.cat))
+
+table(data.cat$EGFR, useNA = "ifany")
+
+sum(data.cat$EGFR == "high" & data.cat$THBS1 == "high", na.rm = TRUE)  #visualising patients and events with double signatures 
+
+double_high <- data.cat[data.cat$EGFR == "high" & 
+                        data.cat$THBS1 == "high", ]
+
+double_high$TIME
+
+double_high[, c("TIME", "EVENT")]
+
+data.cat %>%
+  count(EGFR, THBS1, Sig_Myl1_C1QC)
+
+
+
+# Export patients that belong to each group (high and low)
+
+# Myeloid Signatures
+
+sigs_myl <- c("Sig_Myl1_C1QC", "Sig_Myl2_S100A9", "Sig_Myl3_SPP1")  
+
+
+# EGFR-THBS1
+double_egfr_thbs1 <- data.cat %>%
+  summarise(
+    EGFR_THBS1_high = sum(EGFR == "high" & THBS1 == "high", na.rm = TRUE),
+    EGFR_THBS1_low  = sum(EGFR == "low" & THBS1 == "low", na.rm = TRUE)
+  ) %>%
+  mutate(signature_type = "EGFR–THBS1 double",
+         signature_name = "EGFR_THBS1") %>%
+  rename(EGFR_high_third_high = EGFR_THBS1_high,
+         EGFR_low_third_low = EGFR_THBS1_low)
+
+# EGFR-Myel
+double_egfr_myl <- map_dfr(
+ sigs_myl ,
+  ~ data.cat %>%
+      summarise(
+        EGFR_high_third_high = sum(EGFR == "high" & .data[[.x]] == "high", na.rm = TRUE),
+        EGFR_low_third_low   = sum(EGFR == "low"  & .data[[.x]] == "low", na.rm = TRUE)
+      ) %>%
+      mutate(signature_type = "EGFR–Myl double",
+             signature_name = .x)
+)
+
+# EGFR-Myel-THBS1
+triple_egfr_myl_thbs1 <- map_dfr(
+  sigs_myl,
+  ~ data.cat %>%
+      summarise(
+        EGFR_high_third_high = sum(EGFR == "high" & .data[[.x]] == "high" & THBS1 == "high", na.rm = TRUE),
+        EGFR_low_third_low   = sum(EGFR == "low"  & .data[[.x]] == "low"  & THBS1 == "low", na.rm = TRUE)
+      ) %>%
+      mutate(signature_type = "EGFR–Myl–THBS1 triple",
+             signature_name = .x)
+)
+
+
+combined_summary <- bind_rows(
+  double_egfr_thbs1,
+  double_egfr_myl,
+  triple_egfr_myl_thbs1
+)
+
+
+#library(writexl)
+#write_xlsx(combined_summary, "EGFR_Myl_THBS1_signatures.xlsx")
+
+
+
+# Fit models
+
+fit.EGFR <- survfit(Surv(TIME, EVENT) ~  EGFR,
+                    data = data.cat)
+
+fit.THBS1 <- survfit(Surv(TIME, EVENT) ~  THBS1,
+                     data = data.cat)
+
+fit.Myl1 <- survfit(Surv(TIME, EVENT) ~  Sig_Myl1_C1QC,
+                     data = data.cat)
+
+fit.Myl2 <- survfit(Surv(TIME, EVENT) ~  Sig_Myl2_S100A9,
+                     data = data.cat)
+
+fit.Myl3 <- survfit(Surv(TIME, EVENT) ~  Sig_Myl3_SPP1,
+                     data = data.cat)
+
+
+#List of survfit objects
+fits_list <- list(
+  EGFR = fit.EGFR,
+  THBS1 = fit.THBS1,
+  C1QC = fit.Myl1,
+  S100A9 = fit.Myl2,
+  SPP1 = fit.Myl3
+  # Add more as needed
+)
+
+#Plot myeloid signatures alone
+KMplots <- list()
+
+# Loop over each survfit object
+for (name in names(fits_list)) {
+
+surv_plot <- ggsurvplot(
+ fits_list[[name]],
+  break.time.by = 50,
+  palette = c("#FA1C34","grey"),
+  censor = FALSE,
+  surv.median.line = c("v"), 
+  xlab = "Time [days]",
+  ylab = "OS probability [%]",
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.40,
+  tables.y.text = FALSE,
+  pval = TRUE,
+  pval.size = 8,
+  font.main = c(20, "plain", "black"),
+  font.submain = c(20, "plain", "black"),
+  font.caption = c(20, "plain", "black"),
+  font.x = c(20, "plain", "black"),
+  font.y = c(20, "plain", "black"),
+  font.tickslab = c(20, "plain", "black"),
+  #legend = "none",
+  #legend.labs = c("Signature high", "Signature low")
+)
+
+# Save to KMplots list
+KMplots[[paste0("fit.", name)]] <- surv_plot
+
+
+#Looks like the survminer package makes a grob object that works with ggsave but then it is turned into a custom list object that doesn't work
+##From Internet: I used their internal functions to make a workaround!
+ggsave_workaround <- function(g){survminer:::.build_ggsurvplot(x = g,
+                                                               surv.plot.height = NULL,
+                                                               risk.table.height = NULL,
+                                                               ncensor.plot.height = NULL)}
+g_to_save <- ggsave_workaround(surv_plot)
+ 
+
+#ggsave(filename = file.path(here::here(), paste0("KMplot_", name, "_III.pdf")), 
+       #plot = g_to_save, width=4, height=5)
+
+
+ # save
+ggsave(
+  filename = file.path(plot_dir, paste0(name,"_KMplot_", unique(data.cat$LOCATION) , ".pdf")),
+  plot = g_to_save,
+  width = 4, height = 5
+)
+
+}
+
+KMplots
+
+
+#Fit two signatures EGFR and THBS1 only high and low
+data.cat_low <- data.cat[data.cat$EGFR=="low" & data.cat$THBS1=="low",]
+data.cat_high <- data.cat[data.cat$EGFR=="high" & data.cat$THBS1=="high",]
+data.cat_filtered <- rbind(data.cat_low, data.cat_high)
+data.cat_filtered
+nrow(data.cat_filtered)
+
+fit.both <- survfit(Surv(TIME, EVENT) ~  EGFR + THBS1,
+                    data = data.cat_filtered)
+
+KMplots <- list()
+
+KMplots$fitboth <- ggsurvplot(
+  fit.both,
+  break.time.by = 50,
+  palette = c("#FA1C34","black"), 
+  censor = FALSE,
+  xlab = "Time [days]",
+  ylab = "OS probability [%]",
+   surv.median.line = c("v"),
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.40,
+  tables.y.text = FALSE,
+  pval = TRUE,
+  pval.size = 8,
+  font.main = c(20, "plain", "black"),
+  font.submain = c(20, "plain", "black"),
+  font.caption = c(20, "plain", "black"),
+  font.x = c(20, "plain", "black"),
+  font.y = c(20, "plain", "black"),
+  font.tickslab = c(20, "plain", "black"),
+  #legend = "none",
+  #legend.labs = c("Signature high", "Signature low")
+)
+
+KMplots$fitboth
+
+g_to_save <- ggsave_workaround(KMplots$fitboth)
+ggsave(filename = file.path(plot_dir, "EGFR_THBS1_distal.pdf"),
+                          plot = g_to_save,
+  width = 4, height = 5)
+  
+
+
+
+# Plot Signatures with EGFR
+signatures <- c("Sig_Myl1_C1QC","Sig_Myl2_S100A9", "Sig_Myl3_SPP1") #Make a loop
+
+KMplots <- list()
+
+for (sig in signatures) {
+
+  # keep only concordant low/low and high/high
+  data.cat_low  <- data.cat[data.cat[[sig]] == "low"  & data.cat$EGFR == "low", ]
+  data.cat_high <- data.cat[data.cat[[sig]] == "high" & data.cat$EGFR == "high", ]
+
+  data.cat_filtered <- rbind(data.cat_low, data.cat_high)
+  ncol(data.cat)
+  ncol(data.cat_filtered)
+
+  # survival fit
+  fit.combined <- survfit(
+    Surv(TIME, EVENT) ~ get(sig) + EGFR,
+    data = data.cat_filtered
+  )
+
+  # KM plot
+  KMplots[[sig]] <- ggsurvplot(
+    fit.combined,
+    palette = c("red", "black"),
+    censor = FALSE,
+    xlab = "Time [days]",
+    ylab = "OS probability [%]",
+     surv.median.line = c("v"),
+    risk.table = TRUE,
+    risk.table.col = "strata",
+    risk.table.height = 0.4,
+    tables.y.text = FALSE,
+    pval = TRUE,
+    pval.size = 8,
+    font.main = c(20, "plain", "black"),
+    font.submain = c(20, "plain", "black"),
+    font.caption = c(20, "plain", "black"),
+    font.x = c(20, "plain", "black"),
+    font.y = c(20, "plain", "black"),
+    font.tickslab = c(20, "plain", "black"),
+    break.x.by = 50
+  )
+
+   # save
+  g_to_save <- ggsave_workaround(KMplots[[sig]])
+
+  ggsave(
+    file  = file.path(plot_dir, paste0(sig, "_EGFR_", unique(data.cat$LOCATION), ".pdf")),
+    plot  = g_to_save,
+    width = 4,
+    height = 5
+  )
+
+}
+
+KMplots[[sig]]
+
+# Signature + EGFR + THBS1
+
+signatures <- c("Sig_Myl1_C1QC","Sig_Myl2_S100A9", "Sig_Myl3_SPP1") #Make a loop
+
+KMplots <- list()
+
+for (sig in signatures) {
+
+data.cat_low <- data.cat[data.cat[[sig]] == "low" & data.cat$THBS1 == "low" & data.cat$EGFR == "low", ]
+data.cat_high <- data.cat[data.cat[[sig]]  == "high" & data.cat$THBS1 == "high" & data.cat$EGFR == "high", ]
+data.cat_filtered <- rbind(data.cat_low, data.cat_high)
+data.cat_filtered
+nrow(data)
+nrow(data.cat)
+nrow(data.cat_filtered)
+
+fit.triple <- survfit(Surv(TIME, EVENT) ~ get(sig) + THBS1 + EGFR,
+                        data = data.cat_filtered)
+
+
+# KM plot
+  KMplots[[sig]] <- ggsurvplot(
+  fit.triple,
+  palette = c("red", "black"),
+  censor = FALSE, 
+  xlab = "Time [days]",
+  ylab = "OS probability [%]",
+  linetype = 2,
+  surv.median.line = c("v"),
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.4,
+  tables.y.text = FALSE,
+  pval = TRUE,
+  pval.size = 8,
+  font.main = c(20, "plain", "black"),
+  font.submain = c(20, "plain", "black"),
+  font.caption = c(20, "plain", "black"),
+  font.x = c(20, "plain", "black"),
+  font.y = c(20, "plain", "black"),
+  font.tickslab = c(20, "plain", "black"),
+  #Lgend = "none",
+  break.x.by = 50
+)
+
+   # save
+  g_to_save <- ggsave_workaround(KMplots[[sig]])
+
+ ggsave(
+  file = file.path(plot_dir, paste0(sig, "_EGFR_THBS1_", unique(data.cat$LOCATION), ".pdf")),
+  plot = g_to_save,
+  width = 4,
+  height = 5
+)
+
+ }
+
+ KMplots[[sig]]
+
+
+sessionInfo()
+
+
+
+```
+
+

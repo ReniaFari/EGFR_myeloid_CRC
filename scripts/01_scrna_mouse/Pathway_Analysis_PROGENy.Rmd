@@ -1,0 +1,1064 @@
+---
+title: "scRNASeq PROGENy"
+author: "D. Krauss & O. Fari"
+output:
+  rmdformats::robobook:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+  html_document:
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    keep_md: yes
+  html_notebook:
+    theme: spacelab
+    highlight: textmate
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    toc_float: yes
+---
+
+
+***
+# Load libraries
+```{r setup}
+knitr::opts_chunk$set(message = TRUE)
+# load required libraries
+library(knitr)
+library("tidyverse")
+library("conflicted")
+library("BiocParallel")
+library("ggplot2")
+library("readr")
+library("RColorBrewer")
+library("dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("count", "dplyr")
+conflict_prefer("rowRanges", "MatrixGenerics")
+library("ggpubr")
+library("tibble")
+conflict_prefer("paste", "base")
+conflict_prefer("rename", "dplyr")
+library("tidyr")
+library("org.Hs.eg.db") 
+library("org.Mm.eg.db") 
+conflict_prefer("desc", "dplyr")
+
+library(Seurat)
+library(Matrix)
+library(RCurl)
+library(scales)
+library(cowplot)
+library(SingleCellExperiment)
+library(AnnotationHub)
+library(ensembldb)
+library(multtest)
+library(glmGamPoi)
+library(metap)
+library(patchwork)
+
+library(sctransform)
+library(SingleR)
+library(MAST)
+library(DESeq2)
+library(Nebulosa)
+library(celldex)
+library(ggrepel)
+library("ComplexHeatmap")
+library("circlize")
+
+save_plot <- function(filename, p, width=NULL, height=NULL) {
+  if (!is.null(width) && !is.null(height)) {
+   # ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p, width = width, height = height)
+   # ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p, width = width, height = height)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".pdf")), plot = p, width = width, height = height)
+    
+  } else {
+   # ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p)
+  #  ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".pdf")), plot = p)
+  }
+}
+save_RDS <- function(dir, object,filename){
+  saveRDS(object, file.path(
+    dir,paste0(prefix,"/","_",filename,".RDS")))
+}
+
+```
+
+
+
+
+# Load-prepare dataset & add annotation
+```{r load data}
+load("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/seurat_object_myl.Rdata")
+
+annotation <- data.frame(seurat_clusters = c(0:11),
+                         Celltype = c("Macro_C1qc", "Granulo_S100a9",
+                                      "Macro_Vegfa", "Granulo_Cxcl2","cDC1_CD209a", "Monos_chil3", 
+                                      "DCs_act", "Granulo_Homox1","pDCs", "Mast","Basophilic", "Granulo_Mmp8"))
+annotation$seurat_clusters <- as.factor(annotation$seurat_clusters)
+metadata <- seurat_object_myl@meta.data %>%
+  add_column(Genotype = substr(rownames(seurat_object_myl@meta.data),1,3)) %>%
+  add_column(Genotype_short = substr(rownames(seurat_object_myl@meta.data),1,2)) %>%
+  add_column(rowIDs = rownames(seurat_object_myl@meta.data))
+
+#metadata$CellGeno <- (paste(metadata$Celltype, "_", metadata$Genotype_short))
+  
+
+meta_merge <- left_join(metadata, annotation) %>%
+  column_to_rownames("rowIDs") 
+meta_merge$CellGeno <- (paste0(meta_merge$Celltype, "_", meta_merge$Genotype_short))
+
+
+
+
+all(seurat_object_myl@meta.data$nCount_RNA == meta_merge$nCount_RNA)
+all(rownames(meta_merge) == rownames(seurat_object_myl@meta.data))
+
+
+seurat_object_myl@meta.data <- meta_merge
+# ### workaround color dimplot error: Fehler: Must request at least one colour from a hue palette.
+# seurat_object_myl$cell_label <- Idents(seurat_object_myl)
+  
+  
+
+```
+
+## subset 
+```{r subset dataset}
+###########################
+### subset cluster
+#variable <- c("0", "2","5") #here you can put any variable you want to select
+#seurat_object_subset <- subset(x = seurat_object_myl, idents = variable)
+
+#### OR
+###########################
+### subset parameter
+# variable2 <- c("wtp", "kop") #"wtp" "kop" "kon" "wtn"
+# seurat_object_subset <- subset(seurat_object_myl, subset = Genotype == variable2)
+
+
+
+
+seurat_object_subset <- seurat_object_myl
+```
+
+
+
+
+
+# PROGENy script 
+from here https://saezlab.github.io/progeny/articles/ProgenySingleCell.html
+R version 4.0.4 (2021-02-15)
+```{r PROGENY f. before}
+CellsClusters <- data.frame(Cell = names(Idents(seurat_object_subset)), 
+                            Celltype = as.character((seurat_object_subset$Celltype)),
+                            Genotype = as.character((seurat_object_subset$Genotype_short)),
+                            stringsAsFactors = FALSE)
+CellsClusters$CellGeno <- (paste(CellsClusters$Celltype, "_", CellsClusters$Genotype))
+
+##Create dataframe for Genotypes
+##GenotypeCLusters <- data.frame(Cell = names(Idents(seurat_object_subset)), 
+                            ##Genotype = as.character((seurat_object_subset$Genotype)),
+                            ##stringsAsFactors = FALSE)
+
+## We compute the Progeny activity scores and add them to our Seurat object
+## as a new assay called Progeny. 
+data <- progeny(seurat_object_subset, scale=FALSE, organism="Mouse", top=500, perm=1, 
+                return_assay = TRUE)
+
+## We can now directly apply Seurat functions in our Progeny scores. 
+## For instance, we scale the pathway activity scores. 
+data <- Seurat::ScaleData(data, assay = "progeny") 
+
+## We transform Progeny scores into a data frame to better handling the results
+progeny_scores_df <- 
+  as.data.frame(t(GetAssayData(data, slot = "scale.data", 
+                               assay = "progeny"))) %>%
+  rownames_to_column("Cell") %>%
+  gather(Pathway, Activity, -Cell) 
+
+## We match Progeny scores with the cell clusters.
+progeny_scores_df <- inner_join(progeny_scores_df, CellsClusters)
+
+## We summarize the Progeny scores by cellpopulation
+summarized_progeny_scores <- progeny_scores_df %>% 
+  group_by(Pathway, CellGeno) %>%
+  summarise(avg = mean(Activity), std = sd(Activity))
+
+
+## We prepare the data for the plot
+summarized_progeny_scores_df <- summarized_progeny_scores %>%
+  dplyr::select(-std) %>%   
+  spread(Pathway, avg) %>%
+  data.frame(row.names = 1, check.names = FALSE, stringsAsFactors = FALSE) 
+
+
+paletteLength = 100
+myColor = colorRampPalette(c("Darkblue", "white","red"))(paletteLength)
+summarized_progeny_scores_df <- summarized_progeny_scores_df %>%
+select(c("EGFR","JAK-STAT","PI3K")) 
+
+summarized_progeny_scores_df <- summarized_progeny_scores_df[rev(rownames(summarized_progeny_scores_df)),]
+
+progenyBreaks = c(seq(min(summarized_progeny_scores_df), 0, 
+                      length.out=ceiling(paletteLength/2) + 1),
+                  seq(max(summarized_progeny_scores_df)/paletteLength, 
+                      max(summarized_progeny_scores_df), 
+                      length.out=floor(paletteLength/2)))
+
+progeny_hmap = pheatmap::pheatmap(t(summarized_progeny_scores_df#[,-1]
+                                    ),
+                        fontsize=12, 
+                        fontsize_row = 10, 
+                        color=myColor,
+                        breaks = progenyBreaks,
+                        main = "PROGENy (500)",
+                        cluster_cols = FALSE,
+                        angle_col = 45,
+                        treeheight_col = 0, 
+                        border_color = NA)
+
+p <- progeny_hmap
+save_plot(paste0("EGFR_Pathway_Progeny"), p, height = 10,width = 18)
+
+```
+
+
+
+
+## PROGENy New
+https://saezlab.github.io/decoupleR/articles/pw_sc.html
+version  R version 4.2.2 (2022-10-31)
+```{r PROGENy sc through decoupleR}
+library(progeny)
+library(decoupleR)
+library(pheatmap)
+net <- get_progeny(organism = 'mouse', top = 100)
+net
+
+# Extract the normalized log-transformed counts
+data <- seurat_object_subset
+mat <- as.matrix(data@assays$RNA@data)
+
+# Run wmean
+acts <- run_wmean(mat=mat, net=net, .source='source', .target='target',
+                  .mor='weight', times = 100, minsize = 5)
+acts
+
+# Extract norm_wmean and store it in pathwayswmean in data
+data[['pathwayswmean']] <- acts %>%
+  dplyr::filter(statistic == 'norm_wmean') %>%
+  pivot_wider(id_cols = 'source', names_from = 'condition',
+              values_from = 'score') %>%
+  column_to_rownames('source') %>%
+  Seurat::CreateAssayObject(.)
+
+# Change assay
+DefaultAssay(object = data) <- "pathwayswmean"
+
+# Scale the data
+data <- ScaleData(data)
+data@assays$pathwayswmean@data <- data@assays$pathwayswmean@scale.data
+
+##### For summarising
+## We can now directly apply Seurat functions in our Progeny scores. 
+## For instance, we scale the pathway activity scores. 
+#data <- Seurat::ScaleData(data, assay = "pathwayswmean") 
+
+## We transform Progeny scores into a data frame to better handling the results
+#progeny_scores_df <- 
+  #as.data.frame(t(GetAssayData(data, slot = "scale.data", 
+                               #assay = "pathwayswmean"))) %>%
+  #rownames_to_column("Cell") %>%
+ # gather(Pathway, Activity, -Cell) 
+
+## We match Progeny scores with the cell clusters.
+#progeny_scores_df <- inner_join(progeny_scores_df, CellsClusters)
+
+## We summarize the Progeny scores by cellpopulation
+#summarized_progeny_scores <- progeny_scores_df %>% 
+  #group_by(Pathway, CellGeno) %>%
+  #summarise(avg = mean(Activity), std = sd(Activity))
+
+
+## We prepare the data for the plot
+#summarized_progeny_scores_df <- summarized_progeny_scores %>%
+  #dplyr::select(-std) %>%   
+  #spread(Pathway, avg) %>%
+  #data.frame(row.names = 1, check.names = FALSE, stringsAsFactors = FALSE) 
+
+# Change order of WT and KO in plots
+data$Genotype_short <- factor(x = data$Genotype_short, levels = c("wt", "ko"))
+data$Cell <- factor(x = data$Celltype, levels = c("Macro_C1qc", "Granulo_S100a9",
+                                      "Macro_Vegfa", "Granulo_Cxcl2","cDC1_CD209a", "Monos_chil3", 
+                                      "DCs_act", "Granulo_Homox1","pDCs", "Mast","Basophilic", "Granulo_Mmp8"))
+
+
+#####Visualizing
+# UMAP Activity Plot-EGFR 
+#"lightgrey", "#04103C"
+
+p1 <- DimPlot(data, reduction = "umap", label = TRUE, pt.size = 0.5, split.by = "Genotype_short") + 
+  #NoLegend() + 
+  ggtitle('Cell types')
+p2 <- (FeaturePlot(data, features = c("EGFR"), split.by = "Genotype_short") & #### CHANGE here for plotting a different pathway
+  scale_colour_gradient2(low = 'black', mid = 'lightgrey', high = 'red')) +
+  ggtitle('EGFR activity')
+p1 | p2
+p <- p1 + p2
+save_plot(paste0("_EGFR_Pathway_Progeny_UMAP"), p, height = 10,width = 25)
+
+
+
+# UMAP Activity Plot-PI3K
+
+p1 <- DimPlot(data, reduction = "umap", label = TRUE, pt.size = 0.5, split.by = "Genotype_short") + 
+  #NoLegend() + 
+  ggtitle('Cell types')
+p2 <- (FeaturePlot(data, features = c("PI3K"),pt.size = 0.5, split.by = "Genotype_short") & #### CHANGE here for plotting a different pathway
+  scale_colour_gradient2(low = 'black', mid = 'lightgrey', high = 'red')) +
+  ggtitle('PI3K activity')
+p1 | p2
+p <- p1 + p2
+save_plot(paste0("_PI3K_Pathway_Progeny_UMAP"), p, height = 10 ,width = 25)
+```
+
+
+##
+```{r PROGENy sc through decoupleR Part2}
+#subset  cells- UMAP activity
+Idents(data) <- data$seurat_clusters
+
+data_subset <- subset(x = data, 
+                         idents = c("0","2"))
+Idents(data_subset) <- data_subset$Celltype
+
+p1 <- DimPlot(data_subset, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "Genotype_short") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- DimPlot(data_subset, reduction = "umap", label = TRUE, pt.size = 0.5, group.by = "Celltype") + 
+  NoLegend() + ggtitle('Cell types')
+p3 <- (FeaturePlot(data_subset,  features = c("EGFR"), max.cutoff = 2,  pt.size = 0.5, reduction = "umap", label = T, raster=F) & scale_colour_gradient2(low = '#04103C', mid = 'lightgrey', high = '#e84445')) +
+    ggtitle('EGFR activity')
+p1 | p2 | p3
+
+
+p <- p1 | p2 | p3
+p
+
+#Plot VlnPlot_scCustom PI3K with stats
+install.packages("scCustomize")
+library(scCustomize)
+Idents(data) <- data$Celltype
+colours <- c("grey", "darkred")
+p <- VlnPlot_scCustom(seurat_object = data, 
+                      features = "PI3K",
+                      raster = FALSE,
+                      #group.by = "Genotype_short",
+                      split.by = "Genotype_short",
+                      colors_use = colours,
+                      pt.size = 0.01) + stat_summary(fun = median, geom='point', position = position_dodge(0.9), size = 5, 
+                                                     colour = "dark blue") + stat_compare_means(label = "p.format")
+p
+
+save_plot(paste0("_violin_PI3K_activity_Progeny"), p, height = 10,width = 16)
+
+#smooth violin Pi3k
+q <- VlnPlot(object = data,
+             features = "PI3K",
+             split.by = "Genotype_short",
+             cols = colours, pt.size = 0) + stat_summary(
+               fun = median, geom='point', 
+               position = position_dodge(0.9), size = 5, 
+                                              colour = "light blue") + stat_compare_means(label = "p.signif")
+
+q
+
+save_plot(paste0("_violin_PI3K_activity_Progeny_smooth"), q, height = 10,width = 16)
+
+
+#Plot VlnPlot_scCustom JAK-STAT with stats
+library(scCustomize)
+library(ggpubr)
+Idents(data) <- data$seurat_clusters
+colours <- c("grey", "darkred")
+p <- VlnPlot_scCustom(seurat_object = data, 
+                      features = "JAK-STAT",
+                      raster = FALSE,
+                      #group.by = "Genotype_short",
+                      split.by = "Genotype_short",
+                      colors_use = colours,
+                      pt.size = 0.01) + stat_summary(fun = median, geom='point', position = position_dodge(0.9), size = 5, 
+                                                     colour = "dark blue") + stat_compare_means(label = "p.signif")
+p
+
+save_plot(paste0("_violin_JAK-STAT_activity_Progeny"), p, height = 10,width = 16)
+
+#smooth violin jak
+q <- VlnPlot(object = data,
+             features = "JAK-STAT",
+             split.by = "Genotype_short",
+             cols = colours, pt.size = 0) + stat_summary(
+               fun = median, geom='point', 
+               position = position_dodge(0.9), size = 5, 
+                                              colour = "light blue") + stat_compare_means(label = "p.signif")
+q
+
+
+save_plot(paste0("_violin_JAK-STAT_activity_Progeny_smooth"), q, height = 10,width = 16)
+
+#Plot VlnPlot_scCustom EGFR
+library(scCustomize)
+Idents(data) <- data$seurat_clusters
+p <- VlnPlot_scCustom(seurat_object = data, 
+                      features = "EGFR",
+                      raster = FALSE,
+                      #group.by = "Genotype_short",
+                      split.by = "Genotype_short",
+                       colors_use = colours,
+                      pt.size = 0.01) + stat_summary(fun = median, geom='point', position = position_dodge(0.9), size = 5, 
+                                                     colour = "dark blue") + stat_compare_means(label = "p.signif")
+p
+save_plot(paste0("_violin_EGFR_activity_Progeny"), p, height = 10,width = 16)
+
+#smooth violin egfr
+q <- VlnPlot(object = data,
+             features = "EGFR",
+             split.by = "Genotype_short",
+             cols = colours, pt.size = 0) + stat_summary(
+               fun = median, geom='point', 
+               position = position_dodge(0.9), size = 5, 
+                                              colour = "light blue") + stat_compare_means(label = "p.signif")
+
+q
+
+save_plot(paste0("_violin_EGFR_activity_Progeny_smooth"), q, height = 10,width = 16)
+
+Idents(data) <- data$CellGeno
+# Extract activities from object as a long dataframe
+df <- t(as.matrix(data@assays$pathwayswmean@data)) %>%
+  as.data.frame() %>%
+  mutate(cluster = Idents(data)) %>%
+  pivot_longer(cols = -cluster, names_to = "source", values_to = "score") %>%
+  group_by(cluster, source) %>%
+  summarise(mean = mean(score))
+
+
+# Transform to wide matrix
+top_acts_mat <- df %>%
+  pivot_wider(id_cols = 'cluster', names_from = 'source',
+              values_from = 'mean') 
+
+top_acts_mat <- top_acts_mat %>%
+    add_column(ordering = as.character(top_acts_mat$cluster))
+
+Selected_Cluster <- c("Macro_C1qc_wt","Macro_C1qc_ko", "Macro_Vegfa_wt", "Macro_Vegfa_ko")# 
+
+
+top_acts_mat <- top_acts_mat %>%
+  arrange(desc(ordering), ) %>%
+  select(c("EGFR","JAK-STAT","PI3K")) %>%
+  filter(cluster %in% Selected_Cluster) %>% 
+  column_to_rownames('cluster') %>%
+  as.matrix()
+
+
+# Choose color palette
+palette_length = 100
+my_color = colorRampPalette(c("Darkblue", "white","red"))(palette_length)
+
+my_breaks <- c(seq(-2, 0, length.out=ceiling(palette_length/2) + 1),
+               seq(0.05, 2, length.out=floor(palette_length/2)))
+
+
+
+# Plot Heatmap
+p <- pheatmap::pheatmap(top_acts_mat, border_color = NA, color=my_color, breaks = my_breaks, cluster_rows = FALSE) 
+
+p
+save_plot("_pheatmap_macros", p, height = 10, width = 18)
+
+
+
+
+
+## Human??
+### PLOT WATERFALL
+f_contrast_acts <- acts %>%
+  filter(statistic == 'norm_wmean')
+
+# Plot
+ggplot(f_contrast_acts, aes(x = reorder(source, score), y = score)) + 
+    geom_bar(aes(fill = score), stat = "identity") +
+    scale_fill_gradient2(low = "darkblue", high = "indianred", 
+        mid = "whitesmoke", midpoint = 0) + 
+    theme_minimal() +
+    theme(axis.title = element_text(face = "bold", size = 12),
+        axis.text.x = 
+            element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+        axis.text.y = element_text(size =10, face= "bold"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+    xlab("Pathways")
+
+
+
+
+
+
+
+
+# Extract activities from object as a long dataframe
+df <- t(as.matrix(data@assays$pathwayswmean@data)) %>%
+  as.data.frame()
+hist(df$EGFR, breaks = 1000)
+
+# Extract activities from object as a long dataframe for myeloid cells
+df <- t(as.matrix(data@assays$pathwayswmean@data)) %>%
+  as.data.frame()
+hist(df$EGFR, breaks = 1000)
+
+ordered_egfr = df$EGFR[order(df$EGFR,decreasing = F)]
+plot(x = 1:length(ordered_egfr), y = ordered_egfr)
+
+length(df$EGFR)
+#table(df$EGFR)
+
+length(which(df$EGFR >= 0))
+df_ordered <- df %>% arrange(EGFR)
+  
+quantile(x = df_ordered$EGFR, type = 4)
+
+
+
+egfr.cluster <- df %>%
+  add_column(EGFR_positive = df$EGFR >= 0.59) %>%
+  add_column(EGFR_negative = df$EGFR <= -0.71) %>%
+  mutate(EGFR_pathway = case_when(
+    EGFR_positive == TRUE ~ "up",
+    EGFR_negative == TRUE ~ "down",
+    EGFR_positive == FALSE ~ "else"))
+all(rownames(egfr.cluster) == rownames(data@meta.data))
+
+data$EGFR_pathway_activity <- egfr.cluster$EGFR_pathway
+
+
+############## plot again after classification
+DimPlot(data, 
+        pt.size = 0.5,
+        reduction = "umap", 
+        group.by = "EGFR_pathway_activity",
+        label = F,
+        cols = c("#d9d9d9","lightgrey","#ff0000" )
+        ) &
+    ggtitle('EGFR activity')
+
+
+
+
+p1 <- DimPlot(data, 
+              reduction = "umap", 
+              label = TRUE, pt.size = 0.5, 
+              group.by = "Celltype") + 
+  NoLegend() + ggtitle('Cell types')
+p2 <- DimPlot(data, 
+              reduction = "umap", 
+              label = TRUE, 
+              pt.size = 0.5, 
+              group.by = "Genotype") + 
+  NoLegend() + ggtitle('Cell types')
+p3 <- DimPlot(data, 
+              pt.size = 0.5,
+              reduction = "umap", 
+              group.by = "EGFR_pathway_activity",
+              label = F,
+              cols = c("#d9d9d9","lightgrey","#ff0000")) &
+    ggtitle('EGFR activity')
+p1 | p2 | p3
+
+# p <- p1 | p2 | p3
+# save_plot(paste0(script_number,prefix,"_EGFR_Pathway_Progeny_Myeloid_classification"), p, height = 10,width = 18)
+
+prop.table(table(data$EGFR_pathway_activity,data$Celltype ), margin = 2)
+prop.table(table(data$EGFR_pathway_activity,data$Genotype ), margin = 2)
+```
+
+
+
+
+
+
+
+###PROGENy statistics - IROS suggestion -
+https://bioconductor.org/packages/release/bioc/vignettes/decoupleR/inst/doc/pw_bk.html
+```{r}
+selected_clust <- subset(data, idents = 0 )
+
+
+mat <- as.matrix(selected_clust@assays$RNA@data)
+
+design <- tibble(sample = rownames(selected_clust@meta.data),
+                 condition = selected_clust@meta.data$Genotype)
+all(colnames(mat)==design$sample)
+# # Extract t-values per gene
+# deg <- data$limma_ttop %>%
+#     select(ID, t) %>% 
+#     filter(!is.na(t)) %>% 
+#     column_to_rownames(var = "ID") %>%
+#     as.matrix()
+# head(deg)
+
+
+net <- get_progeny(organism = 'mouse', top = 100)
+net
+# Run wmean
+sample_acts <- run_wmean(mat=mat, net=net, .source='source', .target='target',
+                  .mor='weight', times = 100, minsize = 5)
+sample_acts
+
+
+
+# # Extract t-values per gene
+# deg <- data$limma_ttop %>%
+#     select(ID, t) %>% 
+#     filter(!is.na(t)) %>% 
+#     column_to_rownames(var = "ID") %>%
+#     as.matrix()
+# head(deg)
+```
+
+
+
+### Progeny f. RNASeq for statistics
+
+### PROGENy
+```{r PROGENy all, error=T}
+# Extract the normalized log-transformed counts
+data <- seurat_object_subset
+gene_expr <- as.matrix(data@assays$RNA@data)
+
+
+
+
+
+
+
+
+
+# rld <- rlog(dds, blind=T)
+# gene_expr <- assay(rld)
+# gene_expr <- gene_expr[,which(colnames(gene_expr)%in% colnames(dds))]
+
+library(progeny)
+pathways = progeny(gene_expr, 
+                   scale=FALSE,
+                   organism = "Mouse")
+
+rownames(pathways)
+rownames(pathways) <- seurat_object_subset$Genotype_short
+
+controls =  rownames(pathways) == unique(seurat_object_subset$Genotype_short)[1]
+ctl_mean = apply(pathways[controls,], 2, mean)
+ctl_sd = apply(pathways[controls,], 2, sd)
+pathways_stat = t(apply(pathways, 1, function(x) x - ctl_mean))
+pathways_stat = apply(pathways, 1, function(x) x / ctl_sd)
+
+result = apply(pathways_stat, 1, function(x) {
+    broom::tidy(lm(x ~ !controls)) %>%
+        filter(term == "!controlsTRUE") %>%
+        dplyr::select(-term)
+})
+res.table <- mutate(bind_rows(result), pathway=names(result))
+```
+
+
+
+
+
+
+
+
+## Seurat Myeloid Object- Gene Expression
+```{r sc-myeloid clusters- gene expression}
+# Visualize QC metrics as a violin plot
+library(Seurat)
+library(SeuratData)
+library(cowplot)
+library(patchwork)
+
+# Look for RNA counts and mitochondrial features
+VlnPlot(data, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+# Identify conserved cell type markers
+DefaultAssay(data) <- "RNA"
+nk.markers <- FindConservedMarkers(data, ident.1 = 0, grouping.var = "Genotype_short", verbose = FALSE)
+head(nk.markers)
+
+# Identify differentially expressed genes- between genotypes
+# Plot Dot plot 
+
+markers.to.plot <- c("Il1a", "Il1b", "Ccr1", "S100a9", "Cd86", "Cxcl1", "Lyz2")
+
+Idents(data) <- "CellGeno"
+levels(Idents(data)) <- rev(sort(paste(levels(Idents(data)))))
+DotPlot(data, features = rev(markers.to.plot), dot.scale = 4, cols = c("red"#, "white
+)#,split.by = "Genotype_short"
+) + RotatedAxis()
+
+Idents(data) <- data$seurat_clusters
+
+
+
+
+
+#Identify differential expressed genes- between genotypes
+#Plot Volcano Plot customize- for genes of interest
+
+VlnPlot_scCustom(data, features = c("Fos", "Jun", "Myc", "Sta3", "Akt3", "Nfkb1", "Nfkb2"), 
+                 idents =  c("0", "1", "2", "3", "4", "5"),
+                 split.by = "Genotype_short") + stat_summary(fun = median, geom='point', position = position_dodge(0.9), size = 3, colour = "magenta") + stat_compare_means(label = "p.signif")
+
+#other genes "Il1a", "Il1b", "Ccr1", "S100a9", "Lyz2", "Cd86", "Cd80", "Myd88", "Nfkbia"
+
+# Identify EGFR downstream targets
+# Plot Volcano Plot- for downstream EGFR genes
+q <- VlnPlot(data, features = c("Ccr1", "Ccr2", "Ccl3", "Ccl4", "Ccl5", "Cxcl10", "Ccl9", "Cx3cr1", "Hmgb1", "Ctsg", "App", "Lmnb1"), idents =  c("0", "1", "2", "3", "4", "5", "6", "7"), split.by = "Genotype_short")
+q
+save_plot("_Monos_Chemotaxis", q , height = 10, width = 18)
+
+#ERBB1 "Src", "Akt3", "Pik3r5", "Mtor", "Egfr", "Jun", "Myc", "Prkca", "Sos1"
+# MM6218 "Ifi206", "Cdk6", "Csf1", "Fasn", "Hoxa7", "Jun", "Myc", "Vegfa", "Ifi204", "Ifi207", "Pparg", "Gpr68"
+# MM15900 "Atp5b", "mt-Atp6", "mt-Nd1", "mt-Nd4", "Ndufa2", "Ndufa9", "Dmac2l"
+# MM1516 "Tnfrsf1a", "Tradd", "Casp8", "Casp2", "Casp2", "Ripk1", "Casp3", "Fadd", "Lmnb1"
+# MM4303 "Ccr1", "Ccr2", "Ccl3", "Ccl4", "Ccl5", "Cxcl10", "Ccl9", "Cx3cr1", "Hmgb1", "Ctsg", "App"
+
+# Plot Feature plot for individual genes 
+FeaturePlot(data, features = c("Il1b"), dims = c(1, 2), pt.size = 0.5, split.by = "Genotype_short")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## PSEUDOBULK
+as described in https://hbctraining.github.io/scRNA-seq/lessons/pseudobulk_DESeq2_scrnaseq.html
+
+
+Rational
+- differential expression analysis
+- functions of Seurat available, however p-values often inflated (each cell treated as sample)
+
+Steps:
+1. Subsetting cells f. cell types of interest
+2. Extracting raw counts after QC
+3. Aggregating counts & metadata
+4. Perform DE analysis
+
+New literature
+Benchmarking methods for detecting differential statesbetween conditions from multi-subject single-cellRNA-seq data  Junttila, Smolander, Elo
+https://doi.org/10.1093/bib/bbac286
+
+Confronting false discoveries in single-cell differential expression
+
+```{r Pseudobulk DE all cells analysis, eval=FALSE, include=FALSE}
+library(scater)
+library(edgeR)
+library(Matrix.utils)
+library(magrittr)
+library(purrr)
+library(reshape2)
+library(pheatmap)
+library(apeglm)
+library(png)
+
+seurat_object_myl$AnimalID <- substr(rownames(seurat_object_myl@meta.data),4,7)
+seurat_obj_normalized <- seurat_object_myl
+
+
+
+counts <- seurat_obj_normalized@assays$RNA@counts
+metadata <- seurat_obj_normalized@meta.data
+
+metadata <- metadata %>% #as.factor(sce$condition_id) 
+  mutate(AnimalID = case_when(
+    AnimalID == 3428 ~ "A",
+    AnimalID == 3429 ~ "A",
+    AnimalID == 3430 ~ "C",
+    AnimalID == 3431 ~ "C")) %>%
+  mutate(Celltype = gsub('_','-',metadata$Celltype))
+
+
+
+table(metadata$Genotype_short)
+table(metadata$AnimalID)
+table(metadata$Celltype)
+
+
+#metadata$cluster_id <- factor(seurat_obj_normalized@active.ident)
+#or
+metadata$cluster_id <- factor(metadata$Celltype)
+
+
+sce <- SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+
+
+sce$sample_id <- as.factor(sce$AnimalID) 
+sce$group_id <- as.factor(sce$Genotype_short) #as.factor(sce$condition)
+groups <- colData(sce)[,c("cluster_id","sample_id")]
+
+### define groups to compare
+#sce <- sce[,c(which(sce$group_id == "ko"),which(sce$group_id == "wt"))]
+
+
+# metrics for aggregation
+kids <- purrr::set_names(levels(sce$cluster_id))
+kids 
+nk <- length(kids)
+nk
+sids <- purrr::set_names(levels(sce$sample_id))
+sids
+ns <- length(sids)
+ns
+# Generate sample level metadata
+## Determine the number of cells per sample
+table(sce$sample_id)
+
+## Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce$sample_id))
+
+## Determine how to reoder the samples (rows) of the metadata to match the order of sample names in sids vector
+m <- base::match(sids, sce$sample_id)
+
+## Create the sample level metadata by combining the reordered metadata with the number of cells corresponding to each sample.
+ei <- data.frame(colData(sce)[m, ], 
+                  n_cells, row.names = NULL) %>% 
+                select(-"cluster_id")
+ei
+
+# remove poor quality cells /if not already happened
+dim(sce)
+QC <- perCellQCMetrics(sce)
+sce$is_outlier <- isOutlier(
+  metric = QC$total,
+  nmads = 2, type = "both", log = T)
+
+sce <- sce[ ,!sce$is_outlier]
+dim(sce)
+
+sce <- sce[rowSums(counts(sce) > 1) >=10,]
+dim(sce)
+
+# count aggregation to sample level
+
+groups <- colData(sce)[, c(
+  "cluster_id", 
+  "sample_id")]
+pb <- aggregate.Matrix(t(counts(sce)),
+                       groupings = groups, fun = "sum")
+
+class(pb)
+dim(pb)
+pb[1:6,1:6]
+
+#per cell-type analysis
+# Not every cluster is present in all samples; create a vector that represents how to split samples
+splitf <- sapply(stringr::str_split(rownames(pb),
+                                    pattern = "_",
+                                    n = 2),
+                 `[`, 1)
+# Turn into a list and split the list into components for each cluster and transform, so rows are genes and columns are samples and make rownames as the sample IDs
+pb <- split.data.frame(pb,
+                       factor(splitf)) %>%
+        lapply(function(u)
+                set_colnames(t(u),
+                             stringr::str_extract(rownames(u), "(?<=_)[:alnum:]+")))
+
+class(pb)
+str(pb)
+options(width = 100)
+table(sce$cluster_id, sce$sample_id)
+
+
+
+
+# prep. data.frame for plotting
+get_sample_ids <- function(x){
+        pb[[x]] %>%
+                colnames()
+}
+
+de_samples <- purrr::map(1:length(kids), get_sample_ids) %>%
+        unlist()
+
+# Get cluster IDs for each of the samples
+
+samples_list <- map(1:length(kids), get_sample_ids)
+
+get_cluster_ids <- function(x){
+        rep(names(pb)[x],
+            each = length(samples_list[[x]]))
+}
+
+de_cluster_ids <- map(1:length(kids), get_cluster_ids) %>%
+        unlist()
+
+
+# Create a data frame with the sample IDs, cluster IDs and condition
+
+gg_df <- data.frame(cluster_id = de_cluster_ids,
+                    sample_id = de_samples)
+
+gg_df <- left_join(gg_df, ei[, c("sample_id", "group_id")]) 
+
+
+metadata <- gg_df %>%
+        dplyr::select(cluster_id, sample_id, group_id) 
+metadata$cluster_id <- as.factor(metadata$cluster_id)
+        
+metadata 
+
+# Generate vector of cluster IDs
+clusters <- levels(metadata$cluster_id)
+clusters
+# 
+# Subset the metadata to only the xxx
+cluster_metadata <- metadata[which(metadata$cluster_id == clusters[8]), ]
+
+
+head(cluster_metadata)
+
+# Assign the rownames of the metadata to be the sample IDs
+rownames(cluster_metadata) <- cluster_metadata$sample_id
+head(cluster_metadata)
+
+# Subset the counts to only the XX
+counts <- pb[[clusters[8]]]
+
+cluster_counts <- data.frame(counts[, which(colnames(counts) %in% rownames(cluster_metadata))])
+
+# Check that all of the row names of the metadata are the same and in the same order as the column names of the counts in order to use as input to DESeq2
+all(rownames(cluster_metadata) == colnames(cluster_counts))
+
+```
+
+```{r dds on single comparison all cells, eval=FALSE, include=FALSE}
+
+### create DESeq2 Object
+design_formula <- as.formula(paste0("~ ", 
+                                    "group_id"))
+
+dds <- DESeqDataSetFromMatrix(cluster_counts,
+                              colData = cluster_metadata,
+                              design = design_formula)
+
+# Transform counts for data visualization
+rld <- rlog(dds, blind=TRUE)
+
+# Plot PCA
+
+DESeq2::plotPCA(rld, intgroup = "group_id")
+
+# Extract the rlog matrix from the object and compute pairwise correlation values
+rld_mat <- assay(rld)
+rld_cor <- cor(rld_mat)
+
+# Plot heatmap
+q <- pheatmap::pheatmap(rld_cor, annotation = cluster_metadata[, c("group_id"), drop=F])
+q
+
+### PROGENy
+#rld <- rlog(dds, blind=T)
+gene_expr <- assay(rld)
+gene_expr <- gene_expr[,which(colnames(gene_expr)%in% colnames(dds))]
+
+library(progeny)
+pathways = progeny(gene_expr, 
+                   scale=FALSE,
+                   organism = "Mouse")
+
+rownames(pathways)
+rownames(pathways) <- dds$group_id
+
+controls =  rownames(pathways) == dds$group_id[1]
+ctl_mean = apply(pathways[controls,], 2, mean)
+ctl_sd = apply(pathways[controls,], 2, sd)
+pathways_stat = t(apply(pathways, 1, function(x) x - controls))
+pathways_stat = apply(pathways, 1, function(x) x / controls)
+
+result = apply(pathways_stat, 1, function(x) {
+    broom::tidy(lm(x ~ !controls)) %>%
+        filter(term == "!controlsTRUE") %>% 
+        dplyr::select(-term)}) # gives error because of Inf values
+
+res.table <- mutate(bind_rows(result), pathway=names(result))
+
+plot.pathways <- progeny(gene_expr,
+                    scale = TRUE, 
+                    organism = "Mouse", 
+                    top = 100,
+                    perm = 1, 
+                    verbose = FALSE)
+
+## select significant pathways
+res.sig <- res.table %>%
+  filter(p.value < 0.1)
+selected <- res.sig$pathway
+
+
+myColor = colorRampPalette(brewer.pal(11, "BrBG"))(100) # green from here
+a <- myColor[51:100]
+myColor = colorRampPalette(brewer.pal(11, "RdBu"))(100) # get the red from here
+b <- myColor[1:50]
+myColor <- c(b,a)
+
+
+plot.pathways2 <- plot.pathways[,selected]
+p <- pheatmap::pheatmap(plot.pathways,
+         fontsize=14, 
+         show_rownames = T,
+         cluster_rows = T,
+         cluster_cols = T,
+         show_colnames = T,
+         #fontsize_row = 10 - nrow(plot.pathways) / 15,
+         legend = T,
+         color= rev(myColor), 
+         main = "PROGENy", 
+         angle_col = 45, 
+         #treeheight_col = 0,  
+         border_color = NA)
+p
+#save_plot(paste0(script_number,prefix,"PROGENy_all"), p)
+```
+
+
+
+

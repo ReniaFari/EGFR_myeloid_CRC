@@ -1,0 +1,967 @@
+---
+title: "scRNASeq PROGENy"
+author: "D. Krauss & O. Fari"
+output:
+  rmdformats::robobook:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+  html_document:
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    keep_md: yes
+  html_notebook:
+    theme: spacelab
+    highlight: textmate
+    toc: yes
+    toc_depth: 4
+    df_print: paged
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+
+***
+# Load libraries
+```{r setup}
+knitr::opts_chunk$set(message = TRUE)
+# load required libraries
+library(knitr)
+library("tidyverse")
+library("conflicted")
+library("BiocParallel")
+library("ggplot2")
+library("readr")
+library("RColorBrewer")
+library("dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("count", "dplyr")
+conflict_prefer("rowRanges", "MatrixGenerics")
+library("ggpubr")
+library("tibble")
+conflict_prefer("paste", "base")
+conflict_prefer("rename", "dplyr")
+library("tidyr")
+library("org.Hs.eg.db") 
+library("org.Mm.eg.db") 
+conflict_prefer("desc", "dplyr")
+
+library(Seurat)
+library(Matrix)
+library(RCurl)
+library(scales)
+library(cowplot)
+library(SingleCellExperiment)
+library(AnnotationHub)
+library(ensembldb)
+library(multtest)
+library(glmGamPoi)
+library(metap)
+library(patchwork)
+
+library(sctransform)
+library(SingleR)
+library(MAST)
+library(DESeq2)
+library(Nebulosa)
+library(celldex)
+library(ggrepel)
+library("ComplexHeatmap")
+library("circlize")
+
+save_plot <- function(filename, p, width=NULL, height=NULL) {
+  if (!is.null(width) && !is.null(height)) {
+    #ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p, width = width, height = height)
+    #ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p, width = width, height = height)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".pdf")), plot = p, width = width, height = height)
+    
+  } else {
+    #ggsave(file.path(plotsdir, paste0("/",filename, ".png")), plot = p)
+    #ggsave(file.path(plotsdir, paste0("/",filename, ".svg")), plot = p)
+    ggsave(file.path(plotsdir, paste0("/",filename, ".pdf")), plot = p)
+  }
+}
+save_RDS <- function(dir, object,filename){
+  saveRDS(object, file.path(
+    dir,paste0(prefix,"/","_",filename,".RDS")))
+}
+
+```
+
+
+
+
+# Load-prepare dataset & add annotation
+```{r load data}
+load("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/seurat_object_myl.Rdata")
+
+annotation <- data.frame(seurat_clusters = c(0:11),
+                         Celltype = c("Macro_C1qc", "Granulo_S100a9",
+                                      "Macro_Vegfa", "Granulo_Cxcl2","cDC1_CD209a", "Monos_chil3", 
+                                      "DCs_act", "Granulo_Homox1","pDCs", "Mast","Basophilic", "Granulo_Mmp8"))
+annotation$seurat_clusters <- as.factor(annotation$seurat_clusters)
+metadata <- seurat_object_myl@meta.data %>%
+  add_column(Genotype = substr(rownames(seurat_object_myl@meta.data),1,3)) %>%
+  add_column(Genotype_short = substr(rownames(seurat_object_myl@meta.data),1,2)) %>%
+  add_column(rowIDs = rownames(seurat_object_myl@meta.data))
+
+#metadata$CellGeno <- (paste(metadata$Celltype, "_", metadata$Genotype_short))
+  
+
+meta_merge <- left_join(metadata, annotation) %>%
+  column_to_rownames("rowIDs") 
+meta_merge$CellGeno <- (paste0(meta_merge$Celltype, "_", meta_merge$Genotype_short))
+
+
+
+
+all(seurat_object_myl@meta.data$nCount_RNA == meta_merge$nCount_RNA)
+all(rownames(meta_merge) == rownames(seurat_object_myl@meta.data))
+
+
+seurat_object_myl@meta.data <- meta_merge
+# ### workaround color dimplot error: Fehler: Must request at least one colour from a hue palette.
+# seurat_object_myl$cell_label <- Idents(seurat_object_myl)
+```
+
+
+#Loading the sc10x here
+```{r load data sc10x}
+library(readxl)    
+filename <- "/srv/workspace/rprojects/USER/Seurat_Myeloid/data/10xDiff_GeneExpr_Myel_Thomas_limma_result_stratified_Thommas.xlsx"
+read_excel_allsheets  <- function(filename, tibble = FALSE) {
+    # I prefer straight data.frames
+    # but if you like tidyverse tibbles (the default with read_excel)
+    # then just pass tibble = TRUE
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+
+sc_all_results <- read_excel_allsheets(filename)
+```
+
+
+
+#Loading the smart seq dataset here
+```{r load SmartSeq data}
+library(readxl)    
+filename <- "/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Results_deseq2_new.xlsx"
+read_excel_allsheets  <- function(filename, tibble = FALSE) {
+    # I prefer straight data.frames
+    # but if you like tidyverse tibbles (the default with read_excel)
+    # then just pass tibble = TRUE
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+
+smartseq_all_results <- read_excel_allsheets(filename)
+
+```
+
+## subset 
+```{r subset dataset}
+###########################
+### subset cluster
+#variable <- c("0", "2","5") #here you can put any variable you want to select
+#seurat_object_subset <- subset(x = seurat_object_myl, idents = variable)
+
+#### OR
+###########################
+### subset parameter
+# variable2 <- c("wtp", "kop") #"wtp" "kop" "kon" "wtn"
+# seurat_object_subset <- subset(seurat_object_myl, subset = Genotype == variable2)
+
+
+
+seurat_object_subset <- seurat_object_myl
+```
+
+
+
+#Loading Proteomics Data KOvsWT
+
+```{r ProteomicsData}
+#Different datasheets for different populations- proteomics
+#df_proteomics <- read_tsv("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/limma-voom_WT-KO_Macros.tsv") #### tsvs are WTvsKO
+#df_proteomics <- read_tsv("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/limma-voom_WT-KO_Granulos.tsv")
+#df_proteomics <- read_tsv("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/limma-voom_WT-KO_Monos.tsv")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Monos.xlsx")
+df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Macros.xlsx")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Granus.xlsx")
+
+# df <- df_proteomics %>%
+#   select(-Genes, -ProteinDescriptions) %>%
+#   column_to_rownames("ProteinGroups")
+# 
+# # Remove the missing values
+# dat_tidy <- df %>% drop_na()
+# # Nunber of proteins in original data
+# df %>% summarise(Number_of_proteins = n())
+
+# 
+# 
+# 
+# # Quantile normalisation : the aim is to give different distributions the
+# # same statistical properties
+# quantile_normalisation <- function(df){
+#   
+#   # Find rank of values in each column
+#   df_rank <- map_df(df,rank,ties.method="average")
+#   # Sort observations in each column from lowest to highest 
+#   df_sorted <- map_df(df,sort)
+#   # Find row mean on sorted columns
+#   df_mean <- rowMeans(df_sorted)
+#   
+#   # Function for substiting mean values according to rank 
+#   index_to_mean <- function(my_index, my_mean){
+#     return(my_mean[my_index])
+#   }
+#   
+#   # Replace value in each column with mean according to rank 
+#   df_final <- map_df(df_rank,index_to_mean, my_mean=df_mean)
+#   
+#   return(df_final)
+# }
+# 
+# dat_norm <- dat_tidy %>% # select(-c(protein_accession:protein_description)) %>% 
+#   quantile_normalisation() #%>% 
+#  # bind_cols(dat_tidy[,1:2],.)
+# 
+# 
+# dat_scaled <- scale(t(dat_tidy)) %>% t() %>% 
+#   data.frame() %>%
+#   rownames_to_column("ProteinGroups")
+# 
+# annotation <- df_proteomics %>%
+#   select(ProteinGroups,Genes)
+# 
+# data_scaled_gene_names <- dat_scaled %>%
+#   left_join(annotation) 
+
+```
+
+
+
+
+
+## Overlapping Genes RNAseq and proteomics 
+```{r scRNASeq & Proteomics}
+### three different datasets 
+df_proteomics
+sc_all_results
+smartseq_all_results
+
+# plot all genes
+sig_genes_A <- df_proteomics$GeneID ## PROTEOMIC
+#sig_genes_B <- sc_all_results$`2 M Spp1+`$SYMBOL ## singleCell
+sig_genes_B <- smartseq_all_results$`p13.KO.vs.WT`$SYMBOL ## Smartseq
+
+x_axis = "log2FoldChange SmartSeq"
+#x_axis = "log2FoldChange scRNASeq"
+y_axis = "log2FoldChange Proteomics"
+
+
+length(sig_genes_A)
+length(sig_genes_B)
+overlapping <- base::intersect(sig_genes_B,sig_genes_A )
+length(overlapping)
+
+sig_fc_A <- df_proteomics[df_proteomics$GeneID %in% overlapping,]
+#sig_fc_B <- sc_all_results$`2 M Spp1+`[(sc_all_results$`2 M Spp1+`$SYMBOL) %in% overlapping,]#%>% distinct(gene_name, .keep_all= TRUE) %>% filter(!is.na(gene_name))
+sig_fc_B <- smartseq_all_results$`p13.KO.vs.WT`[(smartseq_all_results$`p13.KO.vs.WT`$SYMBOL) %in% overlapping,]
+
+scatter_plot_A = sig_fc_A %>%
+  select(c(logFC, GeneID, P.Value)) %>%
+  rename(log2FoldChange_A = logFC) %>%
+  rename(pvalue_A = P.Value) %>%
+  rename(SYMBOL = GeneID)
+#%>%
+  #mutate(gene_name = c(make.names(sig_fc_A$gene_name, unique = TRUE)) )
+  
+#for 10x
+#c("blue")
+#scatter_plot = sig_fc_B %>%
+  #select(c(logFC, SYMBOL, adj.P.Val)) %>%
+ # rename(log2FoldChange_B = logFC) %>%
+ # rename(adjpvalue_B = adj.P.Val) %>%
+  #mutate(gene_name = c(make.names(sig_fc_B$gene_name, unique = TRUE)) ) %>%
+ # left_join(scatter_plot_A)# %>%
+  #drop_na()
+
+###for smart seq
+c("blue")
+scatter_plot = sig_fc_B %>%
+  select(c(log2FoldChange, SYMBOL, padj)) %>%
+  rename(log2FoldChange_B = log2FoldChange) %>%
+  rename(adjpvalue_B =  padj) %>%
+  #mutate(gene_name = c(make.names(sig_fc_B$gene_name, unique = TRUE)) ) %>%
+  left_join(scatter_plot_A)# %>%
+  #drop_na()
+
+
+
+# %>%
+#   column_to_rownames("gene_name")
+
+# scatter_plot <- scatter_plot %>%
+#   filter(pvalue_A < 0.05, .preserve = T) %>%
+#   filter(pvalue_B < 0.05, .preserve = T)
+  
+
+scatter_plot <- scatter_plot %>%  
+  add_column(sig_up = c((scatter_plot$adjpvalue_B  < 0.05) & (scatter_plot$pvalue_A < 0.1))) %>%
+  add_column(up_up = c(scatter_plot$log2FoldChange_B > 0 & scatter_plot$log2FoldChange_A >0)) %>%
+  add_column(down_down = c((scatter_plot$log2FoldChange_B < 0) & (scatter_plot$log2FoldChange_A <0))) %>%
+  mutate(color = case_when(
+    up_up == TRUE & sig_up == T ~ "up",
+    down_down == TRUE & sig_up == T ~ "down",
+    up_up == F & down_down == F ~ "else",
+    sig_up == F ~ "else" )) %>%
+  mutate(color_hex = case_when(
+    color == "up" ~ "#a73030",
+    color == "down" ~ "#0073c2",
+    color == "else"  ~ "#808080")) %>%
+  mutate(order = case_when(
+    color == "else"  ~ 1,
+    color == "down"  ~ 2,
+    color == "up"  ~ 3
+  )) %>%
+  mutate(size = case_when(
+    color == "else"  ~ "empty",
+    color == "down"  ~ "round",
+    color == "up"  ~ "round"
+  )) %>%
+  arrange(order)
+
+#scatter_plot <- scatter_plot[rev(order(scatter_plot$color)), ] # did not work
+#scatter_plot$color <- forcats::fct_relevel(scatter_plot$color, "up", "down","else")
+#colori <- relevel(as.factor(colori), "#868686FF")
+#scatter_plot$color <- relevel(as.factor(scatter_plot$color),"up")
+#colori <- c("#0073c2", "#a73030","#808080") #blue, red, grey
+# #0073c2 blue
+# #808080 grey
+# #a73030 red
+colori <- c("#808080","#0073c2","#a73030")
+colori <- c("down"="#0073c2","up"= "#a73030","else"= "#808080")
+sizes <- c("round" = 2.5, "empty" = 1)
+scatter_plot$label <- scatter_plot$SYMBOL
+labels <- c(scatter_plot$SYMBOL[scatter_plot$color_hex == "#a73030"], scatter_plot$SYMBOL[scatter_plot$color_hex == "#0073c2"])
+
+
+# ggplot(scatter_plot, aes(x= log2FoldChange_B, y= log2FoldChange_A)) +
+#     geom_point(aes(color = color, size = size) , #size = 2.5,
+#                stroke = 0.5) +
+#     scale_color_manual(values = colori) +
+#     scale_size_manual(values = sizes) +
+#     theme_minimal() +
+#     labs(title=NULL, x=x_axis, y=y_axis) +
+#     stat_cor(aes(color=color), method = "spearman")
+
+
+p <- ggplot(scatter_plot, aes(x= log2FoldChange_B, y= log2FoldChange_A)) +
+    geom_point(aes(color = color, size = size) , #size = 2.5,
+               stroke = 0.5) +
+    scale_color_manual(values = colori) +
+  #geom_text() +
+   #geom_text(data=subset(scatter_plot, label %in% labels), aes(label=label)) +
+    #geom_text(data=subset(scatter_plot, label %in% labels), aes(label=label)) +
+    geom_text_repel(data=subset(scatter_plot, label %in% labels ), aes(label=label), max.overlaps = 50) +
+    scale_size_manual(values = sizes) +
+    theme_minimal() +
+    labs(title=NULL, x=x_axis, y=y_axis)# +
+    #xlim(-2,2) +
+    #ylim(-7,7)
+p
+ 
+
+
+#save_plot("_ggscatter_Granulocytes_KOvsWT_0.2", p)
+#save_plot("_ggscatter_Macrophages_KOvsWT_0.05", p)
+#save_plot("_ggscatter_Monocytes_KOvsWT_0.2", p)
+save_plot("_ggscatter_Monocytes_Smartseq_0.1", p) #smartseq
+
+#save_plot("_ggscatter_Macrophages_0.05", p)
+#scatter_plot %>% rio::export(here::here(results_dir, "_ggscatter_Macrophages_strict.xlsx"))
+
+
+```
+#Proteomics- Heatmaps
+```{r Proteomics- Heatmaps}
+
+#Read excel heatmaps z scores- # All Populations
+df_proteomics_z <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/20230314_Coloncancer_Vienna_Report_Z-Score.xlsx") # All Populations
+
+
+#Drop NA and remove first two columns
+library(tidyverse)
+df_proteomics_z_new <- df_proteomics_z %>% drop_na() #remove rows with NA from the merged filed #careful even if one sample has NA it is removed
+
+#some names are duplicates #H2-K1, Tmpo)
+# make.unique(c(A, B)) == make.unique(c(make.unique(A), B))
+df_proteomics_z_new$PG.Genes <- make.unique(df_proteomics_z_new$PG.Genes)
+df_proteomics_z_new <- df_proteomics_z_new[-c(1:2, 16:30)]# remove two first columns #keep only Z scoress
+df_proteomics_z_new <- column_to_rownames(df_proteomics_z_new, 'PG.Genes') #try within the dataframe column to row names
+df_proteomics_z_new_selected <- df_proteomics_z_new[c('Egfr', 'Thbs1', 'Thbs4', 'Tgfb', 'Bax', 'Bax', 'C1qc', 'Apoe','Fn1', 'Plac8', 'S100a9'), ] 
+top_mat <-(as.matrix(df_proteomics_z_new_selected,  ))
+
+
+# Choose color palette
+palette_length = 100
+my_color = colorRampPalette(c("purple", "white","orange"))(palette_length)
+
+my_breaks <- c(seq(-2, 0, length.out=ceiling(palette_length/2) + 1),
+               seq(0.05, 2, length.out=floor(palette_length/2)))
+
+# Plot
+p <- pheatmap::pheatmap(top_mat, border_color = NA, color=my_color, breaks = my_breaks,  cluster_rows = FALSE, cluster_cols = FALSE)
+p
+
+save_plot("heatmap_z_macrophages_Egfr_Thbs1_C1qc", p, width=6, height=5)
+
+
+
+# Plot Z-scores for each population separately
+# Read excel Z scores- # Granulocytes
+df_granulos <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/20230314_Coloncancer_Vienna_Report_Z-Score_Granulos.xlsx")
+
+#some names are duplicates #H2-K1, Tmpo)
+# make.unique(c(A, B)) == make.unique(c(make.unique(A), B))
+df_granulos$PG.Genes <- make.unique(df_granulos$PG.Genes)
+df_granulos <- df_granulos[-c(1:2, 8:14)]# remove two first columns #keep only Z scoress
+df_granulos <- column_to_rownames(df_granulos, 'PG.Genes') #try within the dataframe column to row names
+order_wt = c("Granulo_WT_1_z-score", "Granulo_WT_2_z-score","Granulo_KO_1_z-score","Granulo_KO_2_z-score")
+
+df_granulos_reordered <- df_granulos[ , order_wt]
+
+df_granulos_selected <- df_granulos_reordered[c('Myl6','Lyz2','Epx','Myh10', #'Aldh7a1','Mxd1',
+'Myl12b','Lgals1', 'Capn2','Banf1','Acsf2','Lgals3bp','Zbtb7a','Myh9','Txn','Adam19','Pdxdc1','Mbnl3','Rpl9','Apoa1','Rplp1','Ada',
+                                                  #'Txndc17',
+                           'Unc80','Kmt2d','Mylk','Fip1l1','Npl','Sap18','Vim','Muc13','Hpcal1','Cd47','Pigr','Igfbp5','H2bc21','Utp6','Sod1','Sh3bgrl',
+                                                  #'Tgfb1i1',
+                                                  'Ftl1','Nlrp10','Ndufb7','Fga','Plaur',
+                                                  #'Cyb5a',
+                                                  'Mtatp8', #'Dmtn', 
+                                                  'Ncaph', 'Myh11', 'Carm1', 'Gstm5', 'Trmt6', 'Itpr1', #'Habp2', 
+'Trem3', #'Wdr45b', 
+'Atp6ap2'), ] 
+top_mat_granulos <-(as.matrix(df_granulos_selected, ))
+
+# Create annotations
+name_df = data.frame("Genotype" = c(rep("WT",2),rep("KO",2)))
+rownames(name_df) = colnames(top_mat_granulos)
+#Color Annptations
+ann_colors = list(Genotype = c(WT = "black", KO = "darkred"))
+
+#Heatmap
+p <- pheatmap::pheatmap(top_mat_granulos, border_color = NA, color=my_color, breaks = my_breaks, main= "Proteomics_Granulocytes",  cluster_rows = TRUE, cluster_cols = FALSE, cellwidth = 50, cellheight = 8, annotation_col = name_df, annotation_colors = ann_colors)
+p
+
+save_plot("heatmap_z_granulos", p, width=8, height=10)
+
+
+
+# Plot Z-scores for each population
+# Read excel Z scores- # Macrophages
+df_macros <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/20230314_Coloncancer_Vienna_Report_Z-Score_Macros.xlsx")
+
+#some names are duplicates #H2-K1, Tmpo)
+# make.unique(c(A, B)) == make.unique(c(make.unique(A), B))
+df_macros$PG.Genes <- make.unique(df_macros$PG.Genes)
+df_macros <- df_macros[-c(1:2, 8:14)]# remove two first columns #keep only Z scoress
+df_macros <- column_to_rownames(df_macros, 'PG.Genes') #try within the dataframe column to row names
+order_wt = c("Macroph_WT_1_z-score", "Macroph_WT_2_z-score","Macroph_KO_1_z-score","Macroph_KO_2_z-score")
+
+df_macros_reordered <- df_macros[ , order_wt]
+
+df_macros_selected <- df_macros_reordered[c(#'Aatf',
+                                            'Krt26','Myl6','F13b','Pafah1b2','Sh3bgrl3',#'Cyfip2',
+                                            'Nucb1','Sh3bgrl','Psme1','Lims1','Pgls','F2',
+                                            'Mt2','Ggh','Prkcsh','Igf2',#'Crip2',
+                                            'Eno2','P4hb',#'Dctn2',
+                                            'Krt4','Igfbp2','Amy1','Cmpk1','Plg',
+                                            'Lamp2','Tm9sf2','Fhl1','Eloc','Igfbp1','Krt2','Cfb','Krt1','Anp32a','Tmod3','Ptma',
+                                            'Krt75','Gmfb','Hipk2','Rgs10','Plp2',#'Tpt1',
+                                            'Krt73','Banf1','Krt10','Pdcd6','Krt79','Rap1b',
+                              'Hal','Krt77','Anp32e','Ostf1','Txnl1',#'Sgsm2',
+                                            'Fgb'), ]
+                                            #'Mtpn',v#'Srsf1','Rpl36a'
+                                        
+#'F10','Grb2','Mif','Phgdh','Col5a2','Rcn3','Sri','Mrps25','Megf10','Sumo2','Lgals3bp','Dbnl','C1qc','Eef1d','Plac8','F5','Gsta3','Ifitm3','Rps27a',
+#'Pglyrp2','Mtatp8','Rtn4','Mst1','Map2k5','Arhgdib','Gsdma','Ahcyl1','Fam53c','Prl7c1','C5','Lypla2','Igfbp5','Krt5','Thbs1',#'Rad23b',
+#'Rps26',#'Ralgapa1','Stmn1',
+#'Thbs4','Rbp4','Psme2','Rpl37a'
+                              
+
+top_mat_macros <-(as.matrix(df_macros_selected,  ))
+
+# Create annotations
+name_df = data.frame("Genotype" = c(rep("WT",2),rep("KO",2)))
+rownames(name_df) = colnames(top_mat_macros)
+#Color Annptations
+ann_colors = list(Genotype = c(WT = "black", KO = "darkred"))
+
+#Heatmap
+p <- pheatmap::pheatmap(top_mat_macros, border_color = NA, color=my_color, breaks = my_breaks, main= "Proteomics_Macrophages",  cluster_rows = TRUE, cluster_cols = FALSE, cellwidth = 50, cellheight = 10, annotation_col = name_df, annotation_colors = ann_colors)
+p
+
+save_plot("heatmap_z_macrophages", p, width=8, height=16)
+
+
+
+# Plot Z-scores for each population
+# Read excel Z scores- # Monocytes
+df_monos <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/20230314_Coloncancer_Vienna_Report_Z-Score_Monos.xlsx")
+
+#some names are duplicates 
+# make.unique(c(A, B)) == make.unique(c(make.unique(A), B))
+df_monos$PG.Genes <- make.unique(df_monos$PG.Genes)
+df_monos <- df_monos[-c(1:2, 8:14)]# remove two first columns #keep only Z scoress
+df_monos<- column_to_rownames(df_monos, 'PG.Genes') #try within the dataframe column to row names
+order_wt = c("Monocytes_WT_1_z-score", "Monocytes_WT_2_z-score","Monocytes_KO_1_z-score","Monocytes_KO_2_z-score")
+
+df_monos_reordered <- df_monos[ , order_wt]
+
+df_monos_selected <- df_monos_reordered[c('Cdipt','Slfn5', 'Adamtsl4', 'Cd177', 'Max', 'Lcn2', 'Brd9', 'Plvap', 'Pgam5', 'Ppp4c', 'Spp2', 
+#'Cntn4', 'Cdh6', 'Oas1a', #'Itgb6', 
+'Kcnab2', 'Bcl7c', 'Unc93b1', 'Neu1', 'Ttc38', 'Stub1', 'Q8WUR0', 'Bop1', #'Srp19', 
+'Tpm1', 'Ly6c2', 'Nckipsd', 'Pip4k2b', 'Trex1', #'Mrpl55', 
+'Ube2l3', 'Hat1', 'Ppp2ca', 'Man1a1', 'Atp11b', 'Slc2a6', 'Hebp1', 'Cbr3', 'Cdh13', 'Mark3', 'Marcksl1', #'Prkab1', 
+'S100a6', 'Sirt7', 'Arhgef37', 'Rpl7l1', 'Dlst', 'Nptn', 'Cdh11', 'Rbmx', 'Sf3b6', 'Lyz2', 'Hp', 'Sucla2', #'Rpl32', 
+#'Chmp1b2',
+#' 'Dynlt1', 
+ 'Psmb6', 'Rtn4', 'Col6a2'), ] 
+
+
+top_mat_monos <-(as.matrix(df_monos_selected,  ))
+
+# Create annotations
+name_df = data.frame("Genotype" = c(rep("WT",2),rep("KO",2)))
+rownames(name_df) = colnames(top_mat_monos)
+#Color Annptations
+ann_colors = list(Genotype = c(WT = "black", KO = "darkred"))
+
+#Heatmap
+p <- pheatmap::pheatmap(top_mat_monos, border_color = NA, color=my_color, breaks = my_breaks, main= "Proteomics_Monocytes",  cluster_rows = TRUE, cluster_cols = FALSE, cellwidth = 50, cellheight = 10, annotation_col = name_df, annotation_colors = ann_colors)
+p
+
+save_plot("heatmap_z_monocytes", p, width=8, height=16)
+
+```
+
+#Proteomics- Volcano
+```{r Volcano Plots Granulos}
+#Read excel of different populations
+library(readxl)  
+library("writexl")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Macros.xlsx")
+df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Granus.xlsx")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Monos.xlsx")
+df_proteomics$GeneID_upper = toupper(df_proteomics$GeneID)
+
+
+###Create Volcano plot
+# add a column of NAs
+df_proteomics$diffexpressed <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+df_proteomics$diffexpressed[df_proteomics$logFC > 0 & df_proteomics$P.Value < 0.1] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+df_proteomics$diffexpressed[df_proteomics$logFC < 0 & df_proteomics$P.Value < 0.1] <- "DOWN"
+
+
+
+
+# Now write down the name of genes beside the points...
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (adda NA in case they are not)
+df_proteomics$delabel <- NA
+df_proteomics$delabel[df_proteomics$diffexpressed !="NO" ] <- df_proteomics$GeneID_upper[df_proteomics$diffexpressed != "NO"]
+
+
+df_proteomics$genelabels <- ifelse(df_proteomics$GeneID_upper == "LYZ2" 
+                               |df_proteomics$GeneID_upper == "EPX"
+                              |df_proteomics$GeneID_upper == "MXD1"
+                              |df_proteomics$GeneID_upper == "LGALS1"
+                              |df_proteomics$GeneID_upper == "CAPN2"
+                              |df_proteomics$GeneID_upper == "MYL6"
+                              |df_proteomics$GeneID_upper == "FTH1"
+                              |df_proteomics$GeneID_upper == "VIM"
+                              |df_proteomics$GeneID_upper == "RGL2"
+                              |df_proteomics$GeneID_upper == "NDUFB9"
+                              |df_proteomics$GeneID_upper == "MCPT2"
+                              |df_proteomics$GeneID_upper == "ALDH7A1"
+                              |df_proteomics$GeneID_upper == "BANF1"
+                              |df_proteomics$GeneID_upper == "TXN"
+                               |df_proteomics$GeneID_upper == "ADAM19",
+                              TRUE, FALSE)  
+  
+  
+
+#Volcano plot
+q <- ggplot(data = df_proteomics, aes(x=logFC, y=-log10(P.Value), col=diffexpressed #, label= delabel
+                                      )) + 
+    geom_point() + 
+    theme_minimal()+
+  #geom_text_repel(size = 1) +
+  geom_text_repel(
+     aes(logFC, -log10(P.Value)),
+     label = ifelse(df_proteomics$genelabels, df_proteomics$GeneID_upper, ""),
+     box.padding = unit(0.45, "lines"),
+     hjust = 1, max.overlaps = Inf) 
+
+
+
+
+q
+
+# Add lines as before...
+q2 <- q + geom_vline(xintercept=c(--0, -0), col="black")    +  xlim(-4, 4) + 
+                              geom_hline(yintercept=-log10(0.1), col="black") #+  ylim(0, 75) 
+q2
+## Change point color 
+
+# 2. to automate a bit: ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+q3 <- q2 + scale_colour_manual(values = mycolors)
+
+q3
+
+save_plot("_Volcano_Granulos_proteomic_0.1", q3, height = 6,width = 8)
+
+
+
+
+
+```
+
+
+```{r Volcano Plots Macrophages}
+#Read excel of different populations
+library(readxl)  
+library("writexl")
+df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Macros.xlsx")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Granus.xlsx")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Monos.xlsx")
+df_proteomics$GeneID_upper = toupper(df_proteomics$GeneID)
+
+
+###Create Volcano plot
+# add a column of NAs
+df_proteomics$diffexpressed <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+df_proteomics$diffexpressed[df_proteomics$logFC > 0 & df_proteomics$P.Value < 0.1] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+df_proteomics$diffexpressed[df_proteomics$logFC < 0 & df_proteomics$P.Value < 0.1] <- "DOWN"
+
+
+
+
+# Now write down the name of genes beside the points...
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (adda NA in case they are not)
+df_proteomics$delabel <- NA
+df_proteomics$delabel[df_proteomics$diffexpressed !="NO" ] <- df_proteomics$GeneID_upper[df_proteomics$diffexpressed != "NO"]
+
+
+df_proteomics$genelabels <- ifelse(df_proteomics$GeneID_upper == "CRIP2" 
+                               |df_proteomics$GeneID_upper == "ENO2"
+                              |df_proteomics$GeneID_upper == "IGF2"
+                              |df_proteomics$GeneID_upper == "IGFBP2"
+                              |df_proteomics$GeneID_upper == "IGFBP1"
+                              |df_proteomics$GeneID_upper == "THBS1"
+                              |df_proteomics$GeneID_upper == "THBS4"
+                              |df_proteomics$GeneID_upper == "PLEK"
+                              |df_proteomics$GeneID_upper == "RAP1B"
+                              |df_proteomics$GeneID_upper == "F10"
+                              |df_proteomics$GeneID_upper == "F5"
+                              |df_proteomics$GeneID_upper == "MYL6"
+                              |df_proteomics$GeneID_upper == "SH3BGRL3"
+                              |df_proteomics$GeneID_upper == "TPT1"
+                              |df_proteomics$GeneID_upper == "BANF1"
+                               |df_proteomics$GeneID_upper == "ITGAM"
+                               |df_proteomics$GeneID_upper == "PRDX2"
+                               |df_proteomics$GeneID_upper == "BAX"
+                              |df_proteomics$GeneID_upper == "MIF"
+                               |df_proteomics$GeneID_upper == "NPM1"
+                               |df_proteomics$GeneID_upper == "REEP5"
+                               |df_proteomics$GeneID_upper == "ELOC"
+                              |df_proteomics$GeneID_upper == "PSME1"
+                              |df_proteomics$GeneID_upper == "CMPK1"
+                              |df_proteomics$GeneID_upper == "LAMP2"
+                                |df_proteomics$GeneID_upper == "PTMA",
+                              TRUE, FALSE)  
+  
+  
+
+#Volcano plot
+q <- ggplot(data = df_proteomics, aes(x=logFC, y=-log10(P.Value), col=diffexpressed #, label= delabel
+                                      )) + 
+    geom_point() + 
+    theme_minimal()+
+  #geom_text_repel(size = 1) +
+  geom_text_repel(
+     aes(logFC, -log10(P.Value)),
+     label = ifelse(df_proteomics$genelabels, df_proteomics$GeneID_upper, ""),
+     box.padding = unit(0.45, "lines"),
+     hjust = 1, max.overlaps = Inf) 
+
+
+q
+
+# Add lines as before...
+q2 <- q + geom_vline(xintercept=c(--0, -0), col="black")    +  xlim(-4, 4) + 
+                              geom_hline(yintercept=-log10(0.1), col="black") #+  ylim(0, 75) 
+q2
+## Change point color 
+
+# 2. to automate a bit: ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+q3 <- q2 + scale_colour_manual(values = mycolors)
+
+q3
+
+save_plot("_Volcano_Macros_proteomic_0.1", q3, height = 6,width = 8)
+
+
+
+
+
+```
+
+
+
+```{r Volcano Plots Monos}
+#Read excel of different populations
+library(readxl)  
+library("writexl")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Macros.xlsx")
+#df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Granus.xlsx")
+df_proteomics <- read_excel("/srv/workspace/rprojects/USER/Seurat_Myeloid/data/Copy_limma_voom_Monos.xlsx")
+df_proteomics$GeneID_upper = toupper(df_proteomics$GeneID)
+
+
+###Create Volcano plot
+# add a column of NAs
+df_proteomics$diffexpressed <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+df_proteomics$diffexpressed[df_proteomics$logFC > 0 & df_proteomics$P.Value < 0.1] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+df_proteomics$diffexpressed[df_proteomics$logFC < 0 & df_proteomics$P.Value < 0.1] <- "DOWN"
+
+
+
+
+# Now write down the name of genes beside the points...
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (adda NA in case they are not)
+df_proteomics$delabel <- NA
+df_proteomics$delabel[df_proteomics$diffexpressed !="NO" ] <- df_proteomics$GeneID_upper[df_proteomics$diffexpressed != "NO"]
+
+
+df_proteomics$genelabels <- ifelse(df_proteomics$GeneID_upper == "CDIPT" 
+                               |df_proteomics$GeneID_upper == "SLFN5"
+                              |df_proteomics$GeneID_upper == "ADAMTSL4"
+                              |df_proteomics$GeneID_upper == "CD177"
+                              |df_proteomics$GeneID_upper == "MAX"
+                              |df_proteomics$GeneID_upper == "LCN2"
+                              |df_proteomics$GeneID_upper == "BRD9"
+                              |df_proteomics$GeneID_upper == "PLVAP"
+                              |df_proteomics$GeneID_upper == "PGAM5"
+                              |df_proteomics$GeneID_upper == "PPP4C"
+                              |df_proteomics$GeneID_upper == "SPP2"
+                              |df_proteomics$GeneID_upper == "CNTN4"
+                              |df_proteomics$GeneID_upper == "CDH6"
+                              |df_proteomics$GeneID_upper == "OAS1A"
+                              |df_proteomics$GeneID_upper == "ITGB6"
+                               |df_proteomics$GeneID_upper == "KCNAB2"
+                               |df_proteomics$GeneID_upper == "BCL7C"
+                               |df_proteomics$GeneID_upper == "UNC93B1"
+                              |df_proteomics$GeneID_upper == "NEU1",
+                              TRUE, FALSE)  
+  
+  
+
+#Volcano plot
+q <- ggplot(data = df_proteomics, aes(x=logFC, y=-log10(P.Value), col=diffexpressed #, label= delabel
+                                      )) + 
+    geom_point() + 
+    theme_minimal()+
+  #geom_text_repel(size = 1) +
+  geom_text_repel(
+     aes(logFC, -log10(P.Value)),
+     label = ifelse(df_proteomics$genelabels, df_proteomics$GeneID_upper, ""),
+     box.padding = unit(0.45, "lines"),
+     hjust = 1, max.overlaps = Inf) 
+
+
+q
+
+# Add lines as before...
+q2 <- q + geom_vline(xintercept=c(--0, -0), col="black")    +  xlim(-4, 4) + 
+                              geom_hline(yintercept=-log10(0.1), col="black") #+  ylim(0, 75) 
+q2
+
+## Change point color 
+
+# 2. to automate a bit: ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+q3 <- q2 + scale_colour_manual(values = mycolors)
+
+q3
+
+save_plot("_Volcano_Monos_proteomic_0.1", q3, height = 6,width = 8)
+
+
+
+
+```
+
+
+## Overlapping Genes 10X RNA scseq and Smartseq
+```{r scRNASeq & smartSeq}
+### three different datasets 
+df_proteomics
+sc_all_results
+smartseq_all_results
+
+# plot all genes
+#sig_genes_A <- df_proteomics$GeneID ## PROTEOMIC
+sig_genes_A <- sc_all_results$`6 DC Ccr7`$SYMBOL ## singleCell
+sig_genes_B <- smartseq_all_results$`p21.KO.vs.WT`$SYMBOL ## Smartseq
+
+x_axis = "log2FoldChange smartseqRNA"
+#x_axis = "log2FoldChange scRNASeq"
+y_axis = "log2FoldChange 10x scRNA "
+
+length(sig_genes_A)
+length(sig_genes_B)
+overlapping <- base::intersect(sig_genes_B,sig_genes_A )
+length(overlapping)
+
+#sig_fc_A <- df_proteomics[df_proteomics$GeneID %in% overlapping,]
+
+sig_fc_A <- sc_all_results$`6 DC Ccr7`[(sc_all_results$`6 DC Ccr7`$SYMBOL) %in% overlapping,]#%>% distinct(gene_name, .keep_all= TRUE) %>% filter(!is.na(gene_name))
+sig_fc_B <- smartseq_all_results$`p21.KO.vs.WT`[(smartseq_all_results$`p21.KO.vs.WT`$SYMBOL) %in% overlapping,]
+
+#for 10x
+scatter_plot_A = sig_fc_A %>%
+  select(c(logFC, SYMBOL, adj.P.Val)) %>%
+  rename(log2FoldChange_A = logFC) %>%
+  rename(adjpvalue_A = adj.P.Val)# %>%
+  #rename(SYMBOL = SYMBOL)
+#%>%
+  #mutate(gene_name = c(make.names(sig_fc_A$gene_name, unique = TRUE)) )
+  
+
+###for smart seq
+c("blue")
+scatter_plot = sig_fc_B %>%
+  select(c(log2FoldChange, SYMBOL, padj)) %>%
+  rename(log2FoldChange_B = log2FoldChange) %>%
+  rename(adjpvalue_B =  padj) %>%
+  #mutate(gene_name = c(make.names(sig_fc_B$gene_name, unique = TRUE)) ) %>%
+  left_join(scatter_plot_A)# %>%
+  #drop_na()
+
+
+
+
+
+# %>%
+#   column_to_rownames("gene_name")
+
+# scatter_plot <- scatter_plot %>%
+#   filter(pvalue_A < 0.05, .preserve = T) %>%
+#   filter(pvalue_B < 0.05, .preserve = T)
+  
+
+scatter_plot <- scatter_plot %>%  
+  add_column(sig_up = c((scatter_plot$adjpvalue_B  < 0.05) & (scatter_plot$adjpvalue_A < 0.05))) %>%
+  add_column(up_up = c(scatter_plot$log2FoldChange_B > 0 & scatter_plot$log2FoldChange_A >0)) %>%
+  add_column(down_down = c((scatter_plot$log2FoldChange_B < 0) & (scatter_plot$log2FoldChange_A <0))) %>%
+  mutate(color = case_when(
+    up_up == TRUE & sig_up == T ~ "up",
+    down_down == TRUE & sig_up == T ~ "down",
+    up_up == F & down_down == F ~ "else",
+    sig_up == F ~ "else" )) %>%
+  mutate(color_hex = case_when(
+    color == "up" ~ "#a73030",
+    color == "down" ~ "#0073c2",
+    color == "else"  ~ "#808080")) %>%
+  mutate(order = case_when(
+    color == "else"  ~ 1,
+    color == "down"  ~ 2,
+    color == "up"  ~ 3
+  )) %>%
+  mutate(size = case_when(
+    color == "else"  ~ "empty",
+    color == "down"  ~ "round",
+    color == "up"  ~ "round"
+  )) %>%
+  arrange(order)
+
+#scatter_plot <- scatter_plot[rev(order(scatter_plot$color)), ] # did not work
+#scatter_plot$color <- forcats::fct_relevel(scatter_plot$color, "up", "down","else")
+#colori <- relevel(as.factor(colori), "#868686FF")
+#scatter_plot$color <- relevel(as.factor(scatter_plot$color),"up")
+#colori <- c("#0073c2", "#a73030","#808080") #blue, red, grey
+# #0073c2 blue
+# #808080 grey
+# #a73030 red
+colori <- c("#808080","#0073c2","#a73030")
+colori <- c("down"="#0073c2","up"= "#a73030","else"= "#808080")
+sizes <- c("round" = 2.5, "empty" = 1)
+scatter_plot$label <- scatter_plot$SYMBOL
+labels <- c(scatter_plot$SYMBOL[scatter_plot$color_hex == "#a73030"], scatter_plot$SYMBOL[scatter_plot$color_hex == "#0073c2"])
+
+
+# ggplot(scatter_plot, aes(x= log2FoldChange_B, y= log2FoldChange_A)) +
+#     geom_point(aes(color = color, size = size) , #size = 2.5,
+#                stroke = 0.5) +
+#     scale_color_manual(values = colori) +
+#     scale_size_manual(values = sizes) +
+#     theme_minimal() +
+#     labs(title=NULL, x=x_axis, y=y_axis) +
+#     stat_cor(aes(color=color), method = "spearman")
+
+
+p <- ggplot(scatter_plot, aes(x= log2FoldChange_B, y= log2FoldChange_A)) +
+    geom_point(aes(color = color, size = size) , #size = 2.5,
+               stroke = 0.5) +
+    scale_color_manual(values = colori) +
+  #geom_text() +
+   #geom_text(data=subset(scatter_plot, label %in% labels), aes(label=label)) +
+    #geom_text(data=subset(scatter_plot, label %in% labels), aes(label=label)) +
+    geom_text_repel(data=subset(scatter_plot, label %in% labels ), aes(label=label), max.overlaps = 50) +
+    scale_size_manual(values = sizes) +
+    theme_minimal() +
+    labs(title=NULL, x=x_axis, y=y_axis)# +
+    #xlim(-2,2) +
+    #ylim(-7,7)
+p
+ 
+
+
+#save_plot("_ggscatter_Granulocytes_KOvsWT_0.2", p)
+#save_plot("_ggscatter_Macrophages_KOvsWT_0.05", p)
+#save_plot("_ggscatter_Monocytes_KOvsWT_0.2", p)
+#save_plot("_ggscatter_Macrophages_F480hi_sc10x_Smartseq_0.05", p) #smartseq- 10x
+save_plot("_ggscatter_Dedritic_mDC_sc10x_Smartseq_0.05", p) #smartseq- 10x
+
+#save_plot("_ggscatter_Macrophages_0.05", p)
+#scatter_plot %>% rio::export(here::here(results_dir, "_ggscatter_Macrophages_strict.xlsx"))
+
+
+
+
+```
